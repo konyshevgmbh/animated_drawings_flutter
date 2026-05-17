@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../annotation/char_cfg.dart';
+import '../export/gif_exporter.dart';
 import '../rendering/animated_drawing_widget.dart';
 import '../retarget/config_models.dart';
 
@@ -30,11 +31,16 @@ class AnimationPage extends StatefulWidget {
 class _AnimationPageState extends State<AnimationPage> {
   AnimatedDrawingState? _drawingState;
   String? _error;
-  bool _exporting = false;
-  final _repaintKey = GlobalKey();
 
   double _progress = 0.0;
   String _progressStep = 'Initializing…';
+
+  // GIF export state
+  AnimationController? _animCtrl;
+  bool _exporting = false;
+  double _exportProgress = 0.0;
+
+  final _repaintKey = GlobalKey();
 
   @override
   void initState() {
@@ -63,19 +69,55 @@ class _AnimationPageState extends State<AnimationPage> {
 
   Future<void> _exportGif() async {
     final s = _drawingState;
-    if (s == null) return;
-    setState(() => _exporting = true);
+    final ctrl = _animCtrl;
+    if (s == null || ctrl == null || _exporting) return;
+
+    setState(() { _exporting = true; _exportProgress = 0; });
+
+    final savedValue = ctrl.value;
+    ctrl.stop();
+
     try {
       final dir = await getApplicationDocumentsDirectory();
       final outPath = '${dir.path}/animated_drawing.gif';
+      final fps = (1.0 / s.retargeter.frameTime).clamp(1.0, 60.0).round();
 
-      if (!mounted) return;
-      // TODO: hook GIF export to animation controller ticks
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('GIF saved to $outPath')),
+      final file = await exportGif(
+        repaintKey: _repaintKey,
+        frameCount: s.retargeter.frameCount,
+        fps: fps,
+        outputPath: outPath,
+        onFrame: (i) async {
+          if (!mounted) return;
+          ctrl.value = i / s.retargeter.frameCount;
+          setState(() => _exportProgress = (i + 1) / s.retargeter.frameCount);
+          // Let the widget rebuild and render the new frame before capture.
+          await WidgetsBinding.instance.endOfFrame;
+        },
       );
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('GIF saved: ${file.path}'),
+            duration: const Duration(seconds: 4),
+            action: SnackBarAction(label: 'OK', onPressed: () {}),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Export failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     } finally {
-      if (mounted) setState(() => _exporting = false);
+      ctrl.value = savedValue;
+      ctrl.repeat();
+      if (mounted) setState(() { _exporting = false; _exportProgress = 0; });
     }
   }
 
@@ -84,13 +126,32 @@ class _AnimationPageState extends State<AnimationPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Animation'),
+        bottom: _exporting
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(6),
+                child: LinearProgressIndicator(
+                  value: _exportProgress,
+                  minHeight: 6,
+                ),
+              )
+            : null,
         actions: [
-          if (_drawingState != null && !_exporting)
-            IconButton(
-              icon: const Icon(Icons.gif),
-              tooltip: 'Export GIF',
-              onPressed: _exportGif,
-            ),
+          if (_drawingState != null)
+            _exporting
+                ? Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Center(
+                      child: Text(
+                        'Exporting… ${(_exportProgress * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.gif),
+                    tooltip: 'Export GIF',
+                    onPressed: _exportGif,
+                  ),
         ],
       ),
       body: _buildBody(),
@@ -119,7 +180,10 @@ class _AnimationPageState extends State<AnimationPage> {
     return Center(
       child: RepaintBoundary(
         key: _repaintKey,
-        child: AnimatedDrawingWidget(state: _drawingState!),
+        child: AnimatedDrawingWidget(
+          state: _drawingState!,
+          onReady: (ctrl) => _animCtrl = ctrl,
+        ),
       ),
     );
   }
@@ -134,7 +198,6 @@ class _AnimationPageState extends State<AnimationPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Texture thumbnail
               _TexturePreview(path: widget.texturePath),
               const SizedBox(height: 20),
               Text(

@@ -185,7 +185,11 @@ Future<AnimatedDrawingState> buildAnimatedDrawingState({
 class AnimatedDrawingWidget extends StatefulWidget {
   final AnimatedDrawingState state;
 
-  const AnimatedDrawingWidget({super.key, required this.state});
+  /// Called once the [AnimationController] is created.
+  /// Callers can use it to pause/seek the animation (e.g. for GIF export).
+  final void Function(AnimationController)? onReady;
+
+  const AnimatedDrawingWidget({super.key, required this.state, this.onReady});
 
   @override
   State<AnimatedDrawingWidget> createState() => _AnimatedDrawingWidgetState();
@@ -210,6 +214,7 @@ class _AnimatedDrawingWidgetState extends State<AnimatedDrawingWidget>
     _ctrl = AnimationController(vsync: this, duration: duration)
       ..addListener(_onTick)
       ..repeat();
+    widget.onReady?.call(_ctrl);
     _currentVertexPositions = Float32List.fromList(s.origVertexPositions);
     _currentIndices = s.mesh.triangles;
     debugPrint('[Widget] AnimationController started  duration=$duration');
