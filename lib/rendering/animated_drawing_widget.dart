@@ -29,6 +29,10 @@ class AnimatedDrawingState {
   final Float32List origVertexPositions;
   /// UV tex coords [numVerts × 2] — normalized, never change
   final Float32List uvCoords;
+  /// Bounding rect (in imgDim-normalised units = pixels / imgDim) that covers
+  /// every vertex position across the entire animation + margin. Used to size
+  /// the canvas so limbs are never clipped.
+  final ui.Rect animBounds;
 
   const AnimatedDrawingState({
     required this.texture,
@@ -42,6 +46,7 @@ class AnimatedDrawingState {
     required this.retargetCfg,
     required this.origVertexPositions,
     required this.uvCoords,
+    required this.animBounds,
   });
 }
 
@@ -164,6 +169,43 @@ Future<AnimatedDrawingState> buildAnimatedDrawingState({
     cfg: retargetCfg,
   );
 
+  // Scan all animation frames to find the real vertex bounding box.
+  // Margin is expressed in imgDim pixels (e.g. 30 px) so the value is intuitive.
+  onProgress?.call(0.96, 'Computing animation bounds…');
+  const marginPx = 30;
+  final marginNorm = marginPx / imgDim;
+  var bMinX = double.infinity,  bMinY = double.infinity;
+  var bMaxX = double.negativeInfinity, bMaxY = double.negativeInfinity;
+
+  void expand(Float32List verts) {
+    for (int i = 0; i < verts.length ~/ 2; i++) {
+      final x = verts[i * 2], y = verts[i * 2 + 1];
+      if (x < bMinX) bMinX = x;
+      if (y < bMinY) bMinY = y;
+      if (x > bMaxX) bMaxX = x;
+      if (y > bMaxY) bMaxY = y;
+    }
+  }
+
+  expand(origVertexPositions); // rest pose
+  for (int f = 0; f < retargeter.frameCount; f++) {
+    final frame = retargeter.getFrame(f * retargeter.frameTime);
+    rig.setRootPosition(frame.rootPosition[0] + rig.root.initX,
+                        frame.rootPosition[1] + rig.root.initY);
+    rig.setGlobalOrientations(frame.orientations);
+    expand(lbs.solve(rig.getJoints2DPositions()));
+  }
+
+  final animBounds = ui.Rect.fromLTRB(
+    bMinX - marginNorm, bMinY - marginNorm,
+    bMaxX + marginNorm, bMaxY + marginNorm,
+  );
+  debugPrint('[AD] animBounds px: '
+      'L=${(animBounds.left*imgDim).toStringAsFixed(1)} '
+      'T=${(animBounds.top*imgDim).toStringAsFixed(1)} '
+      'R=${(animBounds.right*imgDim).toStringAsFixed(1)} '
+      'B=${(animBounds.bottom*imgDim).toStringAsFixed(1)}');
+
   onProgress?.call(1.0, 'Ready');
   debugPrint('[AD] buildAnimatedDrawingState DONE');
   return AnimatedDrawingState(
@@ -178,6 +220,7 @@ Future<AnimatedDrawingState> buildAnimatedDrawingState({
     retargetCfg: retargetCfg,
     origVertexPositions: origVertexPositions,
     uvCoords: uvCoords,
+    animBounds: animBounds,
   );
 }
 
@@ -305,16 +348,16 @@ class _AnimatedDrawingWidgetState extends State<AnimatedDrawingWidget>
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
-    // Display in the character's natural portrait aspect ratio.
-    // MeshPainter scales x by imgDim/charWidth so the character fills the canvas.
-    final aspectRatio = s.charWidth / s.charHeight;
+    // Aspect ratio comes from the real animation bounding box so the canvas
+    // is exactly large enough to show every limb position without clipping.
+    final aspectRatio = s.animBounds.width / s.animBounds.height;
     return AspectRatio(
       aspectRatio: aspectRatio,
       child: CustomPaint(
         painter: MeshPainter(
           texture: s.texture,
           imgDim: s.imgDim,
-          charWidth: s.charWidth,
+          animBounds: s.animBounds,
           vertexPositions: _currentVertexPositions,
           texCoords: s.uvCoords,
           indices: _currentIndices,

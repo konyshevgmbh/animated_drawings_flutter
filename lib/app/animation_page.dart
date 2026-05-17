@@ -1,12 +1,12 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../annotation/char_cfg.dart';
 import '../export/gif_exporter.dart';
 import '../rendering/animated_drawing_widget.dart';
 import '../retarget/config_models.dart';
+import 'gif_export_sheet.dart';
 
 class AnimationPage extends StatefulWidget {
   final CharConfig charCfg;
@@ -35,11 +35,7 @@ class _AnimationPageState extends State<AnimationPage> {
   double _progress = 0.0;
   String _progressStep = 'Initializing…';
 
-  // GIF export state
   AnimationController? _animCtrl;
-  bool _exporting = false;
-  double _exportProgress = 0.0;
-
   final _repaintKey = GlobalKey();
 
   @override
@@ -67,58 +63,61 @@ class _AnimationPageState extends State<AnimationPage> {
     }
   }
 
-  Future<void> _exportGif() async {
+  void _showExportSheet() {
     final s = _drawingState;
     final ctrl = _animCtrl;
-    if (s == null || ctrl == null || _exporting) return;
+    if (s == null || ctrl == null) return;
 
-    setState(() { _exporting = true; _exportProgress = 0; });
+    final widgetSize = _repaintKey.currentContext?.size;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => GifExportSheet(
+        widgetSize: widgetSize,
+        onExport: ({required speed, required pixelRatio, required outputPath, required backgroundColor, required onProgress}) async {
+          // Compute delay directly from BVH frameTime — no clamping — so the
+          // GIF plays at exactly the same speed as the live animation × speed.
+          final bvhFps = 1.0 / s.retargeter.frameTime;
+          final effectiveFps = bvhFps * speed;
 
-    final savedValue = ctrl.value;
-    ctrl.stop();
+          // GIF browsers enforce a minimum of 2 cs (20 ms) ≈ 50 fps max.
+          // If the animation is faster than that, skip frames proportionally.
+          const maxGifFps = 50.0;
+          final step = (effectiveFps / maxGifFps).ceil().clamp(1, s.retargeter.frameCount);
+          final captureCount = (s.retargeter.frameCount / step).ceil();
 
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final outPath = '${dir.path}/animated_drawing.gif';
-      final fps = (1.0 / s.retargeter.frameTime).clamp(1.0, 60.0).round();
+          // Delay in centiseconds: one GIF frame covers `step` native frames.
+          final delayCs = (step * 100 / effectiveFps).round().clamp(1, 65535);
 
-      final file = await exportGif(
-        repaintKey: _repaintKey,
-        frameCount: s.retargeter.frameCount,
-        fps: fps,
-        outputPath: outPath,
-        onFrame: (i) async {
-          if (!mounted) return;
-          ctrl.value = i / s.retargeter.frameCount;
-          setState(() => _exportProgress = (i + 1) / s.retargeter.frameCount);
-          // Let the widget rebuild and render the new frame before capture.
-          await WidgetsBinding.instance.endOfFrame;
+          final savedValue = ctrl.value;
+          ctrl.stop();
+          try {
+            return await exportGif(
+              repaintKey: _repaintKey,
+              frameCount: captureCount,
+              delayCs: delayCs,
+              pixelRatio: pixelRatio,
+              outputPath: outputPath,
+              bgArgb: backgroundColor?.toARGB32(),
+              onFrame: (i) async {
+                if (!mounted) return;
+                final frame = (i * step).clamp(0, s.retargeter.frameCount - 1);
+                ctrl.value = frame / s.retargeter.frameCount;
+                onProgress((i + 1) / captureCount);
+                await WidgetsBinding.instance.endOfFrame;
+              },
+            );
+          } finally {
+            ctrl.value = savedValue;
+            ctrl.repeat();
+          }
         },
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('GIF saved: ${file.path}'),
-            duration: const Duration(seconds: 4),
-            action: SnackBarAction(label: 'OK', onPressed: () {}),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Export failed: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } finally {
-      ctrl.value = savedValue;
-      ctrl.repeat();
-      if (mounted) setState(() { _exporting = false; _exportProgress = 0; });
-    }
+      ),
+    );
   }
 
   @override
@@ -126,32 +125,13 @@ class _AnimationPageState extends State<AnimationPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Animation'),
-        bottom: _exporting
-            ? PreferredSize(
-                preferredSize: const Size.fromHeight(6),
-                child: LinearProgressIndicator(
-                  value: _exportProgress,
-                  minHeight: 6,
-                ),
-              )
-            : null,
         actions: [
           if (_drawingState != null)
-            _exporting
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Center(
-                      child: Text(
-                        'Exporting… ${(_exportProgress * 100).toStringAsFixed(0)}%',
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                    ),
-                  )
-                : IconButton(
-                    icon: const Icon(Icons.gif),
-                    tooltip: 'Export GIF',
-                    onPressed: _exportGif,
-                  ),
+            IconButton(
+              icon: const Icon(Icons.gif_box_outlined),
+              tooltip: 'Export GIF',
+              onPressed: _showExportSheet,
+            ),
         ],
       ),
       body: _buildBody(),

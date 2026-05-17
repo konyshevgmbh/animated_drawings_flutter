@@ -6,9 +6,9 @@ import 'package:flutter/material.dart';
 class MeshPainter extends CustomPainter {
   final ui.Image texture;
   final int imgDim;
-  /// Original character width (before padding to imgDim). Used to scale x
-  /// so the character fills the canvas width (canvas uses portrait aspect ratio).
-  final int charWidth;
+  /// Actual bounding rect of all animation frames, in imgDim-normalised units.
+  /// Covers the full range of deformed vertex positions so limbs are never clipped.
+  final ui.Rect animBounds;
   /// Deformed vertex positions [numVerts × 2] normalized [0,1]
   final Float32List vertexPositions;
   /// UV texture coordinates [numVerts × 2] normalized [0,1]
@@ -19,7 +19,7 @@ class MeshPainter extends CustomPainter {
   MeshPainter({
     required this.texture,
     required this.imgDim,
-    required this.charWidth,
+    required this.animBounds,
     required this.vertexPositions,
     required this.texCoords,
     required this.indices,
@@ -30,14 +30,14 @@ class MeshPainter extends CustomPainter {
     final n = vertexPositions.length ~/ 2;
     if (n == 0 || indices.isEmpty) return;
 
-    // Map vertex positions to canvas pixels.
-    // Vertices are normalized by imgDim; scale x by imgDim/charWidth so the
-    // character fills the canvas width (which has aspect ratio charWidth/charHeight).
-    final xScale = size.width * imgDim / charWidth;
+    // Map [animBounds.left..right] × [animBounds.top..bottom] → canvas pixels.
+    final bw = animBounds.width;
+    final bh = animBounds.height;
+
     final positions = Float32List(n * 2);
     for (int i = 0; i < n; i++) {
-      positions[i * 2] = vertexPositions[i * 2] * xScale;
-      positions[i * 2 + 1] = vertexPositions[i * 2 + 1] * size.height;
+      positions[i * 2]     = (vertexPositions[i * 2]     - animBounds.left) / bw * size.width;
+      positions[i * 2 + 1] = (vertexPositions[i * 2 + 1] - animBounds.top)  / bh * size.height;
     }
 
     // Map UV [0,1] to image pixel coords
@@ -72,5 +72,5 @@ class MeshPainter extends CustomPainter {
       old.vertexPositions != vertexPositions ||
       old.indices != indices ||
       old.texture != texture ||
-      old.charWidth != charWidth;
+      old.animBounds != animBounds;
 }
