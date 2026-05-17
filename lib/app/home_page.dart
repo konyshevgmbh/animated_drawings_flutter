@@ -8,6 +8,15 @@ import '../retarget/config_models.dart';
 import 'animation_page.dart';
 import 'annotation_page.dart';
 
+const _motions = [
+  ('dab',           'assets/config/motion/dab.yaml',          'assets/config/retarget/fair1_ppf.yaml'),
+  ('wave_hello',    'assets/config/motion/wave_hello.yaml',    'assets/config/retarget/fair1_ppf.yaml'),
+  ('jumping',       'assets/config/motion/jumping.yaml',       'assets/config/retarget/fair1_ppf.yaml'),
+  ('zombie',        'assets/config/motion/zombie.yaml',        'assets/config/retarget/fair1_ppf.yaml'),
+  ('jesse_dance',   'assets/config/motion/jesse_dance.yaml',   'assets/config/retarget/mixamo_fff.yaml'),
+  ('jumping_jacks', 'assets/config/motion/jumping_jacks.yaml', 'assets/config/retarget/cmu1_pfp.yaml'),
+];
+
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
 
@@ -94,9 +103,13 @@ class HomePage extends StatelessWidget {
       return;
     }
 
-    // Default motion: dab + fair1_ppf
-    final motionYaml = await rootBundle.loadString('assets/config/motion/dab.yaml');
-    final retargetYaml = await rootBundle.loadString('assets/config/retarget/fair1_ppf.yaml');
+    if (!context.mounted) return;
+    final motionIdx = await _pickMotionDialog(context);
+    if (motionIdx == null) return;
+
+    final (_, motionAsset, retargetAsset) = _motions[motionIdx];
+    final motionYaml = await rootBundle.loadString(motionAsset);
+    final retargetYaml = await rootBundle.loadString(retargetAsset);
     final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
     final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
 
@@ -114,4 +127,31 @@ class HomePage extends StatelessWidget {
       ),
     );
   }
+}
+
+Future<int?> _pickMotionDialog(BuildContext context) {
+  int selected = 0;
+  return showDialog<int>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setState) => AlertDialog(
+        title: const Text('Select motion'),
+        content: RadioGroup<int>(
+          groupValue: selected,
+          onChanged: (v) => setState(() => selected = v!),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(_motions.length, (i) => RadioListTile<int>(
+              title: Text(_motions[i].$1),
+              value: i,
+            )),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, selected), child: const Text('OK')),
+        ],
+      ),
+    ),
+  );
 }

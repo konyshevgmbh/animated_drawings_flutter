@@ -3,7 +3,7 @@ import 'package:yaml/yaml.dart';
 class MotionConfig {
   final String bvhPath;     // asset path, e.g. 'assets/bvh/fair1/dab.bvh'
   final int startFrame;
-  final int endFrame;
+  final int? endFrame; // null → use all frames
   final String groundplaneJoint;
   final List<List<String>> forwardPerpJointVectors; // pairs of joint names
   final double scale;
@@ -13,7 +13,7 @@ class MotionConfig {
   const MotionConfig({
     required this.bvhPath,
     required this.startFrame,
-    required this.endFrame,
+    this.endFrame,
     required this.groundplaneJoint,
     required this.forwardPerpJointVectors,
     required this.scale,
@@ -34,7 +34,7 @@ class MotionConfig {
     return MotionConfig(
       bvhPath: bvhPath,
       startFrame: (doc['start_frame_idx'] as num? ?? 0).toInt(),
-      endFrame: (doc['end_frame_idx'] as num? ?? 0).toInt(),
+      endFrame: (doc['end_frame_idx'] as num?)?.toInt(),
       groundplaneJoint: doc['groundplane_joint'] as String,
       forwardPerpJointVectors: fwd,
       scale: (doc['scale'] as num).toDouble(),

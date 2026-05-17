@@ -17,7 +17,7 @@ const _motions = [
   ('wave_hello', 'assets/config/motion/wave_hello.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
   ('jumping', 'assets/config/motion/jumping.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
   ('zombie', 'assets/config/motion/zombie.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
-  ('jesse_dance', 'assets/config/motion/jesse_dance.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
+  ('jesse_dance', 'assets/config/motion/jesse_dance.yaml', 'assets/config/retarget/mixamo_fff.yaml'),
   ('jumping_jacks', 'assets/config/motion/jumping_jacks.yaml', 'assets/config/retarget/cmu1_pfp.yaml'),
 ];
 
