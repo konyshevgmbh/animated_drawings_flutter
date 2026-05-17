@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
@@ -20,6 +21,8 @@ const _motions = [
   ('jumping_jacks', 'assets/config/motion/jumping_jacks.yaml', 'assets/config/retarget/cmu1_pfp.yaml'),
 ];
 
+enum _EditMode { joints, mask }
+
 class AnnotationPage extends StatefulWidget {
   final String imagePath;
   const AnnotationPage({super.key, required this.imagePath});
@@ -29,13 +32,35 @@ class AnnotationPage extends StatefulWidget {
 }
 
 class _AnnotationPageState extends State<AnnotationPage> {
+  // Loading
   bool _loading = true;
   String _status = 'Loading image…';
   double _progress = 0.0;
-  Uint8List? _overlayBytes;
+
+  // Annotation results
+  Uint8List? _textureBytes;
   String? _texturePath;
   String? _maskPath;
-  CharConfig? _charCfg;
+  int _imgW = 0;
+  int _imgH = 0;
+  List<CharJoint> _skeleton = [];
+  Uint8List _maskData = Uint8List(0);
+
+  // Edit mode
+  _EditMode _editMode = _EditMode.joints;
+
+  // Joint editor
+  int _selectedJointIdx = -1;
+  int _jointVersion = 0;
+
+  // Mask editor
+  bool _maskEraseMode = false;
+  double _brushSize = 20.0;
+  int _maskVersion = 0;
+  Offset? _brushCenter;
+
+  // Layout
+  Size _viewSize = Size.zero;
   int _selectedMotion = 0;
 
   PoseEstimator? _estimator;
@@ -52,24 +77,41 @@ class _AnnotationPageState extends State<AnnotationPage> {
     super.dispose();
   }
 
+  // ── Transform ──────────────────────────────────────────────────────────────
+
+  ({double scale, double ox, double oy}) _getTransform() {
+    if (_imgW == 0 || _imgH == 0 || _viewSize.isEmpty) {
+      return (scale: 1.0, ox: 0.0, oy: 0.0);
+    }
+    final s = math.min(_viewSize.width / _imgW, _viewSize.height / _imgH);
+    return (
+      scale: s,
+      ox: (_viewSize.width - _imgW * s) / 2,
+      oy: (_viewSize.height - _imgH * s) / 2,
+    );
+  }
+
+  Offset _toImageCoords(Offset w) {
+    final t = _getTransform();
+    return Offset((w.dx - t.ox) / t.scale, (w.dy - t.oy) / t.scale);
+  }
+
+  // ── Annotation pipeline ────────────────────────────────────────────────────
+
   Future<void> _runAnnotation() async {
     final tmpDir = await getTemporaryDirectory();
     final outDir = '${tmpDir.path}/annotation_out';
     await Directory(outDir).create(recursive: true);
-    final imagePath = widget.imagePath;
 
     try {
-      // ── Step 1: segmentation in isolate (pure Dart, no plugin) ──────────
       _setStatus('Segmenting…', progress: 0.05);
       final port = ReceivePort();
-      await Isolate.spawn(_segmentIsolate, [imagePath, outDir, port.sendPort]);
+      await Isolate.spawn(_segmentIsolate, [widget.imagePath, outDir, port.sendPort]);
 
       late final _SegResult segResult;
       await for (final msg in port) {
         if (msg is String && msg.startsWith('status:')) {
-          final label = msg.substring(7);
-          final p = label.contains('Segment') ? 0.20 : 0.05;
-          _setStatus(label, progress: p);
+          _setStatus(msg.substring(7), progress: msg.contains('Segment') ? 0.20 : 0.05);
         } else if (msg is _SegResult) {
           segResult = msg;
           port.close();
@@ -79,13 +121,9 @@ class _AnnotationPageState extends State<AnnotationPage> {
         }
       }
 
-      debugPrint('[Ann] segmentation done  ${segResult.w}×${segResult.h}  mask=${segResult.maskPath}');
-
-      // ── Step 2: pose estimation on main isolate (ONNX needs plugin ctx) ──
       _setStatus('Loading ONNX model…', progress: 0.50);
       _estimator = PoseEstimator();
       await _estimator!.init();
-      debugPrint('[Ann] ONNX session ready');
 
       _setStatus('Estimating pose…', progress: 0.60);
       final imageBytes = await File(segResult.texturePath).readAsBytes();
@@ -93,45 +131,32 @@ class _AnnotationPageState extends State<AnnotationPage> {
       final maskBytes = await File(segResult.maskPath).readAsBytes();
       final maskImage = img.decodeImage(maskBytes);
       final kpts = await _estimator!.estimate(image, mask: maskImage, straightenLegs: true);
-      debugPrint('[Ann] ONNX result: ${kpts == null ? "no pose found" : "${kpts.length} keypoints"}');
 
-      // ── Step 3: build skeleton ──────────────────────────────────────────
       _setStatus('Building skeleton…', progress: 0.80);
       final skeleton = kpts != null
           ? buildSkeleton(kpts)
           : defaultSkeleton(segResult.h, segResult.w);
-      debugPrint('[Ann] skeleton source: ${kpts != null ? "ONNX" : "default fallback"}');
 
-      final charCfg = CharConfig(
-          height: segResult.h, width: segResult.w, skeleton: skeleton);
-      final charCfgYaml = charCfg.toYamlString();
-      await File('$outDir/char_cfg.yaml').writeAsString(charCfgYaml);
-
-      // ── Step 4: draw joint overlay ──────────────────────────────────────
-      _setStatus('Drawing overlay…', progress: 0.90);
-      final overlay = img.Image.from(image);
-      for (final j in skeleton) {
-        final x = j.x.round().clamp(0, segResult.w - 1);
-        final y = j.y.round().clamp(0, segResult.h - 1);
-        img.fillCircle(overlay,
-            x: x, y: y, radius: 5, color: img.ColorRgba8(255, 0, 0, 255));
-        if (j.parent != null) {
-          final par = skeleton.firstWhere((s) => s.name == j.parent);
-          img.drawLine(overlay,
-              x1: par.x.round().clamp(0, segResult.w - 1),
-              y1: par.y.round().clamp(0, segResult.h - 1),
-              x2: x, y2: y,
-              color: img.ColorRgba8(0, 255, 0, 180));
+      // Extract mask as flat Uint8List (0/255)
+      final maskRaw = Uint8List(segResult.w * segResult.h);
+      if (maskImage != null) {
+        for (int y = 0; y < segResult.h; y++) {
+          for (int x = 0; x < segResult.w; x++) {
+            maskRaw[y * segResult.w + x] = maskImage.getPixel(x, y).r.toInt();
+          }
         }
       }
-      final overlayBytes = Uint8List.fromList(img.encodePng(overlay));
 
+      _setStatus('Done', progress: 1.0);
       if (mounted) {
         setState(() {
-          _charCfg = charCfg;
-          _overlayBytes = overlayBytes;
+          _textureBytes = imageBytes;
           _texturePath = segResult.texturePath;
           _maskPath = segResult.maskPath;
+          _imgW = segResult.w;
+          _imgH = segResult.h;
+          _skeleton = List<CharJoint>.from(skeleton);
+          _maskData = maskRaw;
           _loading = false;
         });
       }
@@ -142,14 +167,124 @@ class _AnnotationPageState extends State<AnnotationPage> {
   }
 
   void _setStatus(String s, {double progress = -1}) {
-    debugPrint('[Ann] status: $s');
-    if (mounted) {
-      setState(() {
-        _status = s;
-        if (progress >= 0) _progress = progress;
-      });
+    if (mounted) setState(() { _status = s; if (progress >= 0) _progress = progress; });
+  }
+
+  // ── Gesture handlers ───────────────────────────────────────────────────────
+
+  void _onPanStart(DragStartDetails d) {
+    final imgPt = _toImageCoords(d.localPosition);
+    if (_editMode == _EditMode.joints) {
+      final hitR = 30.0 / _getTransform().scale;
+      setState(() => _selectedJointIdx = _nearestJoint(imgPt, hitR));
+    } else {
+      setState(() => _brushCenter = imgPt);
+      _applyBrush(imgPt);
     }
   }
+
+  void _onPanUpdate(DragUpdateDetails d) {
+    final imgPt = _toImageCoords(d.localPosition);
+    if (_editMode == _EditMode.joints) {
+      if (_selectedJointIdx >= 0) _moveJoint(_selectedJointIdx, imgPt);
+    } else {
+      setState(() => _brushCenter = imgPt);
+      _applyBrush(imgPt);
+    }
+  }
+
+  void _onPanEnd(DragEndDetails d) {
+    if (_editMode == _EditMode.joints) {
+      setState(() => _selectedJointIdx = -1);
+    } else {
+      setState(() => _brushCenter = null);
+    }
+  }
+
+  int _nearestJoint(Offset imgPt, double maxDist) {
+    int best = -1;
+    double bestDist = maxDist;
+    for (int i = 0; i < _skeleton.length; i++) {
+      final j = _skeleton[i];
+      final d = (Offset(j.x, j.y) - imgPt).distance;
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+  }
+
+  void _moveJoint(int idx, Offset imgPt) {
+    final j = _skeleton[idx];
+    final updated = List<CharJoint>.from(_skeleton);
+    updated[idx] = CharJoint(
+      name: j.name,
+      parent: j.parent,
+      x: imgPt.dx.clamp(0.0, _imgW.toDouble()),
+      y: imgPt.dy.clamp(0.0, _imgH.toDouble()),
+    );
+    setState(() { _skeleton = updated; _jointVersion++; });
+  }
+
+  void _applyBrush(Offset imgPt) {
+    final r = _brushSize.round();
+    final cx = imgPt.dx.round();
+    final cy = imgPt.dy.round();
+    final fill = _maskEraseMode ? 0 : 255;
+    bool changed = false;
+    for (int dy = -r; dy <= r; dy++) {
+      for (int dx = -r; dx <= r; dx++) {
+        if (dx * dx + dy * dy > r * r) continue;
+        final nx = cx + dx; final ny = cy + dy;
+        if (nx < 0 || nx >= _imgW || ny < 0 || ny >= _imgH) continue;
+        final idx = ny * _imgW + nx;
+        if (_maskData[idx] != fill) { _maskData[idx] = fill; changed = true; }
+      }
+    }
+    if (changed) setState(() => _maskVersion++);
+  }
+
+  // ── Navigate to animation ──────────────────────────────────────────────────
+
+  Future<void> _onAnimate() async {
+    if (_skeleton.isEmpty || _texturePath == null || _maskPath == null) return;
+
+    final charCfg = CharConfig(height: _imgH, width: _imgW, skeleton: _skeleton);
+
+    // Persist edited mask
+    final maskImg = img.Image(width: _imgW, height: _imgH);
+    for (int y = 0; y < _imgH; y++) {
+      for (int x = 0; x < _imgW; x++) {
+        final v = _maskData[y * _imgW + x];
+        maskImg.setPixelRgba(x, y, v, v, v, 255);
+      }
+    }
+    await File(_maskPath!).writeAsBytes(img.encodePng(maskImg));
+
+    final tmpDir = await getTemporaryDirectory();
+    await File('${tmpDir.path}/annotation_out/char_cfg.yaml')
+        .writeAsString(charCfg.toYamlString());
+
+    final (_, motionAsset, retargetAsset) = _motions[_selectedMotion];
+    final motionYaml = await rootBundle.loadString(motionAsset);
+    final retargetYaml = await rootBundle.loadString(retargetAsset);
+    final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
+    final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
+
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AnimationPage(
+          charCfg: charCfg,
+          texturePath: _texturePath!,
+          maskPath: _maskPath!,
+          motionCfg: motionCfg,
+          retargetCfg: retargetCfg,
+        ),
+      ),
+    );
+  }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -169,11 +304,9 @@ class _AnnotationPageState extends State<AnnotationPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text(
-                _status,
-                textAlign: TextAlign.center,
-                style: Theme.of(context).textTheme.bodyLarge,
-              ),
+              Text(_status,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyLarge),
               const SizedBox(height: 12),
               LinearProgressIndicator(
                 value: _progress > 0 ? _progress : null,
@@ -182,11 +315,9 @@ class _AnnotationPageState extends State<AnnotationPage> {
               ),
               const SizedBox(height: 6),
               if (_progress > 0)
-                Text(
-                  '${(_progress * 100).toStringAsFixed(0)}%',
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
+                Text('${(_progress * 100).toStringAsFixed(0)}%',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 20),
               _AnnotationStepsList(progress: _progress),
             ],
@@ -199,67 +330,316 @@ class _AnnotationPageState extends State<AnnotationPage> {
   Widget _buildReady() {
     return Column(
       children: [
-        if (_overlayBytes != null)
-          Expanded(
-              child: Image.memory(_overlayBytes!, fit: BoxFit.contain)),
-        const Divider(),
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            children: [
-              const Text('Select motion:'),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: List.generate(_motions.length, (i) {
-                  return ChoiceChip(
-                    label: Text(_motions[i].$1),
-                    selected: _selectedMotion == i,
-                    onSelected: (_) =>
-                        setState(() => _selectedMotion = i),
-                  );
-                }),
+        _buildModeBar(),
+        Expanded(
+          child: LayoutBuilder(builder: (ctx, constraints) {
+            _viewSize = constraints.biggest;
+            return Stack(children: [
+              Positioned.fill(
+                child: Image.memory(_textureBytes!, fit: BoxFit.contain,
+                    gaplessPlayback: true),
               ),
-              const SizedBox(height: 16),
-              ElevatedButton.icon(
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('Animate'),
-                onPressed: _onAnimate,
+              Positioned.fill(
+                child: GestureDetector(
+                  onPanStart: _onPanStart,
+                  onPanUpdate: _onPanUpdate,
+                  onPanEnd: _onPanEnd,
+                  child: _editMode == _EditMode.joints
+                      ? CustomPaint(
+                          painter: _JointPainter(
+                            skeleton: _skeleton,
+                            imgW: _imgW,
+                            imgH: _imgH,
+                            selectedIdx: _selectedJointIdx,
+                            version: _jointVersion,
+                          ),
+                        )
+                      : CustomPaint(
+                          painter: _MaskPainter(
+                            maskData: _maskData,
+                            imgW: _imgW,
+                            imgH: _imgH,
+                            version: _maskVersion,
+                            eraseMode: _maskEraseMode,
+                            brushCenter: _brushCenter,
+                            brushSize: _brushSize,
+                          ),
+                        ),
+                ),
               ),
-            ],
-          ),
+            ]);
+          }),
         ),
+        if (_editMode == _EditMode.mask) _buildMaskControls(),
+        const Divider(height: 1),
+        _buildMotionPanel(),
       ],
     );
   }
 
-  Future<void> _onAnimate() async {
-    if (_charCfg == null || _texturePath == null || _maskPath == null) return;
-    final (_, motionAsset, retargetAsset) = _motions[_selectedMotion];
+  Widget _buildModeBar() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: SegmentedButton<_EditMode>(
+        segments: const [
+          ButtonSegment(
+            value: _EditMode.joints,
+            label: Text('Joints'),
+            icon: Icon(Icons.scatter_plot),
+          ),
+          ButtonSegment(
+            value: _EditMode.mask,
+            label: Text('Mask'),
+            icon: Icon(Icons.brush),
+          ),
+        ],
+        selected: {_editMode},
+        onSelectionChanged: (s) => setState(() => _editMode = s.first),
+      ),
+    );
+  }
 
-    final motionYaml = await rootBundle.loadString(motionAsset);
-    final retargetYaml = await rootBundle.loadString(retargetAsset);
+  Widget _buildMaskControls() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+      child: Row(
+        children: [
+          ToggleButtons(
+            isSelected: [!_maskEraseMode, _maskEraseMode],
+            onPressed: (i) => setState(() => _maskEraseMode = i == 1),
+            borderRadius: BorderRadius.circular(8),
+            children: const [
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.brush, size: 16),
+                  SizedBox(width: 4),
+                  Text('Paint'),
+                ]),
+              ),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.auto_fix_normal, size: 16),
+                  SizedBox(width: 4),
+                  Text('Erase'),
+                ]),
+              ),
+            ],
+          ),
+          const SizedBox(width: 8),
+          const Icon(Icons.circle_outlined, size: 14),
+          Expanded(
+            child: Slider(
+              value: _brushSize,
+              min: 5,
+              max: 60,
+              divisions: 11,
+              label: '${_brushSize.round()}px',
+              onChanged: (v) => setState(() => _brushSize = v),
+            ),
+          ),
+          SizedBox(
+            width: 40,
+            child: Text('${_brushSize.round()}px',
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+        ],
+      ),
+    );
+  }
 
-    final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
-    final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
-
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => AnimationPage(
-          charCfg: _charCfg!,
-          texturePath: _texturePath!,
-          maskPath: _maskPath!,
-          motionCfg: motionCfg,
-          retargetCfg: retargetCfg,
-        ),
+  Widget _buildMotionPanel() {
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text('Select motion:'),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            children: List.generate(_motions.length, (i) {
+              return ChoiceChip(
+                label: Text(_motions[i].$1),
+                selected: _selectedMotion == i,
+                onSelected: (_) => setState(() => _selectedMotion = i),
+              );
+            }),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.play_arrow),
+            label: const Text('Animate'),
+            onPressed: _onAnimate,
+          ),
+        ],
       ),
     );
   }
 }
 
-// ─── Annotation pipeline step checklist ───────────────────────────────────────
+// ─── Joint overlay painter ─────────────────────────────────────────────────────
+
+class _JointPainter extends CustomPainter {
+  final List<CharJoint> skeleton;
+  final int imgW, imgH, selectedIdx, version;
+
+  const _JointPainter({
+    required this.skeleton,
+    required this.imgW,
+    required this.imgH,
+    required this.selectedIdx,
+    required this.version,
+  });
+
+  ({double scale, double ox, double oy}) _transform(Size size) {
+    final s = math.min(size.width / imgW, size.height / imgH);
+    return (scale: s, ox: (size.width - imgW * s) / 2, oy: (size.height - imgH * s) / 2);
+  }
+
+  Offset _pt(CharJoint j, ({double scale, double ox, double oy}) t) =>
+      Offset(j.x * t.scale + t.ox, j.y * t.scale + t.oy);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (skeleton.isEmpty) return;
+    final t = _transform(size);
+
+    final nameToIdx = <String, int>{for (int i = 0; i < skeleton.length; i++) skeleton[i].name: i};
+    final bonePaint = Paint()..strokeWidth = 2.5..style = PaintingStyle.stroke;
+    final shadowPaint = Paint()..color = Colors.black.withAlpha(140)..style = PaintingStyle.fill;
+    final fillPaint = Paint()..style = PaintingStyle.fill;
+    final selectRingPaint = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+
+    // Bones
+    for (final j in skeleton) {
+      if (j.parent == null) continue;
+      final pi = nameToIdx[j.parent];
+      if (pi == null) continue;
+      bonePaint.color = _boneColor(j.name).withAlpha(200);
+      canvas.drawLine(_pt(skeleton[pi], t), _pt(j, t), bonePaint);
+    }
+
+    // Joints
+    for (int i = 0; i < skeleton.length; i++) {
+      final j = skeleton[i];
+      final pt = _pt(j, t);
+      final sel = i == selectedIdx;
+      final r = sel ? 9.0 : 6.5;
+      canvas.drawCircle(pt, r + 1.5, shadowPaint);
+      fillPaint.color = sel ? Colors.yellow : _jointColor(j.name);
+      canvas.drawCircle(pt, r, fillPaint);
+      if (sel) canvas.drawCircle(pt, r, selectRingPaint);
+    }
+  }
+
+  Color _boneColor(String name) {
+    if (name.startsWith('left_')) return Colors.cyanAccent;
+    if (name.startsWith('right_')) return Colors.orangeAccent;
+    return Colors.lightGreenAccent;
+  }
+
+  Color _jointColor(String name) {
+    if (name.startsWith('left_')) return Colors.blue;
+    if (name.startsWith('right_')) return Colors.deepOrange;
+    return Colors.green;
+  }
+
+  @override
+  bool shouldRepaint(_JointPainter old) =>
+      old.version != version || old.selectedIdx != selectedIdx;
+}
+
+// ─── Mask overlay painter ──────────────────────────────────────────────────────
+
+class _MaskPainter extends CustomPainter {
+  final Uint8List maskData;
+  final int imgW, imgH, version;
+  final bool eraseMode;
+  final Offset? brushCenter;
+  final double brushSize;
+
+  const _MaskPainter({
+    required this.maskData,
+    required this.imgW,
+    required this.imgH,
+    required this.version,
+    required this.eraseMode,
+    required this.brushCenter,
+    required this.brushSize,
+  });
+
+  ({double scale, double ox, double oy}) _transform(Size size) {
+    final s = math.min(size.width / imgW, size.height / imgH);
+    return (scale: s, ox: (size.width - imgW * s) / 2, oy: (size.height - imgH * s) / 2);
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final t = _transform(size);
+    final imgRect = Rect.fromLTWH(t.ox, t.oy, imgW * t.scale, imgH * t.scale);
+
+    canvas.save();
+    canvas.clipRect(imgRect);
+
+    // Dim everything outside the mask
+    canvas.drawRect(imgRect, Paint()..color = Colors.black.withValues(alpha: 0.35));
+
+    // Highlight foreground (red overlay) — row-by-row run-length for perf
+    final fgPaint = Paint()
+      ..color = Colors.red.withValues(alpha: 0.45)
+      ..style = PaintingStyle.fill;
+
+    for (int y = 0; y < imgH; y++) {
+      int? start;
+      final rowBase = y * imgW;
+      final wy = y * t.scale + t.oy;
+      final rowH = t.scale;
+      for (int x = 0; x <= imgW; x++) {
+        final fg = x < imgW && maskData[rowBase + x] > 0;
+        if (fg && start == null) {
+          start = x;
+        } else if (!fg && start != null) {
+          canvas.drawRect(
+            Rect.fromLTWH(start * t.scale + t.ox, wy, (x - start) * t.scale, rowH),
+            fgPaint,
+          );
+          start = null;
+        }
+      }
+    }
+
+    canvas.restore();
+
+    // Brush cursor ring
+    if (brushCenter != null) {
+      final bx = brushCenter!.dx * t.scale + t.ox;
+      final by = brushCenter!.dy * t.scale + t.oy;
+      final br = brushSize * t.scale;
+      canvas.drawCircle(
+        Offset(bx, by),
+        br,
+        Paint()
+          ..color = (eraseMode ? Colors.lightBlue : Colors.white).withValues(alpha: 0.75)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_MaskPainter old) =>
+      old.version != version ||
+      old.brushCenter != brushCenter ||
+      old.eraseMode != eraseMode ||
+      old.brushSize != brushSize;
+}
+
+// ─── Step checklist (loading screen) ──────────────────────────────────────────
 
 class _AnnotationStepsList extends StatelessWidget {
   final double progress;
@@ -271,7 +651,7 @@ class _AnnotationStepsList extends StatelessWidget {
     (0.50, 'Load ONNX model'),
     (0.60, 'Estimate pose (YOLOv8n)'),
     (0.80, 'Build skeleton'),
-    (0.90, 'Draw joint overlay'),
+    (0.90, 'Extract mask data'),
     (1.00, 'Done'),
   ];
 
@@ -313,11 +693,10 @@ class _AnnotationStepsList extends StatelessWidget {
   }
 }
 
-// ─── Isolate: segmentation only (no plugins) ───────────────────────────────
+// ─── Isolate: segmentation only (no plugins) ──────────────────────────────────
 
 class _SegResult {
-  final String maskPath;
-  final String texturePath;
+  final String maskPath, texturePath;
   final int w, h;
   _SegResult(this.maskPath, this.texturePath, this.w, this.h);
 }
@@ -334,8 +713,7 @@ Future<void> _segmentIsolate(List<dynamic> args) async {
     if (image == null) throw Exception('Cannot decode image');
 
     if (image.width > 1000 || image.height > 1000) {
-      final scale =
-          1000 / (image.width > image.height ? image.width : image.height);
+      final scale = 1000 / math.max(image.width, image.height);
       image = img.copyResize(image,
           width: (image.width * scale).round(),
           height: (image.height * scale).round());
