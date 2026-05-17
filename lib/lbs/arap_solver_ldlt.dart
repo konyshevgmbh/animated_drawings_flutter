@@ -164,6 +164,8 @@ class _SparseLDLT {
     final lCol = List<List<(int, double)>>.generate(n, (_) => []);
     final lRow = List<List<(int, double)>>.generate(n, (_) => []);
     final w = Float64List(n); // dense workspace
+    int negDiagCount = 0;
+    double minDiag = double.infinity;
 
     for (int j = 0; j < n; j++) {
       // Load lower triangle column j of A into workspace
@@ -181,7 +183,10 @@ class _SparseLDLT {
       }
 
       // Store D[j]; clamp away from zero for numerical safety
-      d[j] = w[j] > 1e-14 ? w[j] : 1e-14;
+      final rawD = w[j];
+      if (rawD < minDiag) minDiag = rawD;
+      if (rawD <= 0) negDiagCount++;
+      d[j] = rawD > 1e-14 ? rawD : 1e-14;
       w[j] = 0.0;
 
       // Store L[i,j] = w[i] / D[j] for all i > j with w[i] != 0 (incl. fill)
@@ -193,6 +198,11 @@ class _SparseLDLT {
           w[i] = 0.0;
         }
       }
+    }
+
+    debugPrint('[LDL^T] D[] min=${minDiag.toStringAsExponential(2)}  negatives=$negDiagCount/$n');
+    if (negDiagCount > 0) {
+      debugPrint('[LDL^T] WARNING: $negDiagCount negative diagonals → matrix not SPD, solution may blow up!');
     }
 
     // ── Convert lRow → CSR ───────────────────────────────────────────────────
@@ -412,6 +422,7 @@ class ArapSolver {
     // ── A1 matrix [2*(E+Jv) × 2*V] and G matrix [2*E × 2*V] ─────────────────
     final a1 = <(int, int, double)>[];
     final gCoo = <(int, int, double)>[];
+    int skippedEdges = 0;
 
     for (int k = 0; k < E; k++) {
       final vi = edgeList[k].$1, vj = edgeList[k].$2;
@@ -444,7 +455,7 @@ class ArapSolver {
         m11 += Gk[r * 2 + 1] * Gk[r * 2 + 1];
       }
       final det = m00 * m11 - m01 * m01;
-      if (det.abs() < 1e-12) continue;
+      if (det.abs() < 1e-12) { skippedEdges++; continue; }
       final inv = [m11 / det, -m01 / det, -m01 / det, m00 / det];
 
       final emCols = 2 + gkRows;
@@ -488,6 +499,13 @@ class ArapSolver {
           }
         }
       }
+    }
+
+    if (skippedEdges > 0) {
+      debugPrint('[ARAP] WARNING: $skippedEdges/$E edges skipped (degenerate G-matrix, det≈0)');
+    }
+    if (Jv < J) {
+      debugPrint('[ARAP] WARNING: only $Jv/$J joints got pin constraints (${J - Jv} dropped — outside mesh)');
     }
 
     for (int pj = 0; pj < Jv; pj++) {
@@ -600,6 +618,30 @@ class ArapSolver {
       result[vi * 2 + 1] = y.isFinite ? y : _origVerts[vi * 2 + 1];
     }
 
+    // Out-of-bounds check runs every frame; logs only when something is wrong.
+    {
+      int oob = 0;
+      int worstVi = -1;
+      double worstDist = 0;
+      for (int vi = 0; vi < numVertices; vi++) {
+        final x = result[vi * 2], y = result[vi * 2 + 1];
+        final dx = x < 0 ? -x : (x > 1 ? x - 1 : 0.0);
+        final dy = y < 0 ? -y : (y > 1 ? y - 1 : 0.0);
+        final dist = dx > dy ? dx : dy;
+        if (dist > 0.05) {
+          oob++;
+          if (dist > worstDist) { worstDist = dist; worstVi = vi; }
+        }
+      }
+      if (oob > 0) {
+        final wx = result[worstVi * 2], wy = result[worstVi * 2 + 1];
+        final ox = _origVerts[worstVi * 2], oy = _origVerts[worstVi * 2 + 1];
+        debugPrint('[ARAP #$_solveCount] WARNING: $oob/$numVertices verts outside [0,1]  '
+            'worst=v$worstVi new=(${wx.toStringAsFixed(3)},${wy.toStringAsFixed(3)}) '
+            'orig=(${ox.toStringAsFixed(3)},${oy.toStringAsFixed(3)})');
+      }
+    }
+    // Detailed range log (throttled)
     if (logThis) {
       double xmin = double.infinity, xmax = double.negativeInfinity;
       double ymin = double.infinity, ymax = double.negativeInfinity;

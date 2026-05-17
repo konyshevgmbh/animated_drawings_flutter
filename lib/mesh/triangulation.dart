@@ -59,9 +59,27 @@ CharMesh buildMesh(Uint8List maskData, int imgDim, CharConfig charCfg) {
   }
   debugPrint('[Mesh]   interior points inside mask=${inside.length}');
 
-  // 4. All points = outline + interior
-  final allPts = [...simplified, ...inside];
-  debugPrint('[Mesh] step 4 — total input points=${allPts.length} (outline=${simplified.length} + interior=${inside.length})');
+  // 4. Combine, deduplicating points within 0.5 px of each other.
+  //    Near-duplicate points produce machine-epsilon-area triangles that make
+  //    the ARAP step-2 system under-determined (zero-vector edge constraints
+  //    leave those vertices unconstrained → pulled to zero by the solver).
+  debugPrint('[Mesh] step 4 — deduplicate and combine points (merge radius 0.5 px)');
+  const double mergeDistSq = 0.5 * 0.5;
+  final allPts = <Offset>[...simplified];
+  int droppedNearDups = 0;
+  for (final p in inside) {
+    bool tooClose = false;
+    for (final existing in allPts) {
+      final dx = p.dx - existing.dx, dy = p.dy - existing.dy;
+      if (dx * dx + dy * dy < mergeDistSq) { tooClose = true; break; }
+    }
+    if (tooClose) { droppedNearDups++; } else { allPts.add(p); }
+  }
+  if (droppedNearDups > 0) {
+    debugPrint('[Mesh]   dropped $droppedNearDups near-duplicate interior points');
+  }
+  debugPrint('[Mesh] step 4 — total input points=${allPts.length} '
+      '(outline=${simplified.length} + interior=${allPts.length - simplified.length})');
   final points = allPts.map((o) => Point<double>(o.dx, o.dy)).toList();
 
   // 5. Delaunay triangulation
@@ -71,13 +89,19 @@ CharMesh buildMesh(Uint8List maskData, int imgDim, CharConfig charCfg) {
   tri.processAllPoints();
   debugPrint('[Mesh]   raw triangles=${tri.triangles.length ~/ 3}');
 
-  // 6. Filter: keep triangles whose centroid is inside contour
-  debugPrint('[Mesh] step 6 — filter triangles by centroid-in-contour');
+  // 6. Filter: keep triangles whose centroid is inside contour and are non-degenerate.
+  //    Degenerate triangles (area < 0.1 px²) produce zero-vector edges that
+  //    leave adjacent vertices unconstrained in the ARAP step-2 solve.
+  debugPrint('[Mesh] step 6 — filter triangles by centroid-in-contour and area');
   final goodTris = <int>[];
+  int skippedDegenerate = 0;
   for (int i = 0; i < tri.triangles.length; i += 3) {
     final a = tri.getPoint(tri.triangles[i]);
     final b = tri.getPoint(tri.triangles[i + 1]);
     final c = tri.getPoint(tri.triangles[i + 2]);
+    // Area in pixel space — skip near-zero triangles
+    final area = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() * 0.5;
+    if (area < 0.1) { skippedDegenerate++; continue; }
     final centroid = Offset(
       (a.x + b.x + c.x) / 3,
       (a.y + b.y + c.y) / 3,
@@ -88,6 +112,9 @@ CharMesh buildMesh(Uint8List maskData, int imgDim, CharConfig charCfg) {
       goodTris.add(tri.triangles[i + 2]);
     }
   }
+  if (skippedDegenerate > 0) {
+    debugPrint('[Mesh]   skipped $skippedDegenerate degenerate triangles (area<0.1 px²)');
+  }
   debugPrint('[Mesh]   triangles after filter=${goodTris.length ~/ 3}');
 
   // 7. Normalize vertices to [0,1]
@@ -96,6 +123,38 @@ CharMesh buildMesh(Uint8List maskData, int imgDim, CharConfig charCfg) {
       .toList();
 
   final triangles = Uint16List.fromList(goodTris);
+
+  // Diagnostic: empty mesh guard
+  if (goodTris.isEmpty) {
+    debugPrint('[Mesh] WARNING: no triangles survived centroid filter — mesh is empty!');
+  } else {
+    // Paranoia: verify Delaunay uses the original input ordering
+    final si = tri.triangles[0];
+    if (si >= 0 && si < allPts.length) {
+      final ep = allPts[si];
+      final gp = tri.getPoint(si);
+      if ((gp.x - ep.dx).abs() > 1.0 || (gp.y - ep.dy).abs() > 1.0) {
+        debugPrint('[Mesh] WARNING: Delaunay index-ordering mismatch at idx=$si — '
+            'allPts=(${ep.dx.toStringAsFixed(0)},${ep.dy.toStringAsFixed(0)}) '
+            'getPoint=(${gp.x.toStringAsFixed(0)},${gp.y.toStringAsFixed(0)})');
+      }
+    }
+    // Count degenerate triangles (near-zero area in normalized [0,1] space)
+    int degCount = 0;
+    double minArea = double.infinity;
+    for (int i = 0; i < goodTris.length; i += 3) {
+      final a = verts[goodTris[i]], b = verts[goodTris[i + 1]], c = verts[goodTris[i + 2]];
+      final area = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() * 0.5;
+      if (area < 1e-8) degCount++;
+      if (area < minArea) minArea = area;
+    }
+    if (degCount > 0) {
+      debugPrint('[Mesh] WARNING: $degCount/${goodTris.length ~/ 3} degenerate triangles '
+          '(area<1e-8)  minArea=${minArea.toStringAsExponential(2)}');
+    } else {
+      debugPrint('[Mesh] triangles OK  count=${goodTris.length ~/ 3}  minArea=${minArea.toStringAsExponential(2)}');
+    }
+  }
 
   // 8. BFS joint-to-triangle mapping
   debugPrint('[Mesh] step 7 — BFS joint-to-triangle mapping');

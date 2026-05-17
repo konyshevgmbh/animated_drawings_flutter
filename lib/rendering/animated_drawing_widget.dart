@@ -252,10 +252,29 @@ class _AnimatedDrawingWidgetState extends State<AnimatedDrawingWidget>
         sb.write('\n  [${allJ[i].name}] (${joints[i*2].toStringAsFixed(3)},${joints[i*2+1].toStringAsFixed(3)})');
       }
       debugPrint(sb.toString());
+      // Check for out-of-bounds joint positions
+      final oobJoints = <String>[];
+      for (int i = 0; i < jc; i++) {
+        final x = joints[i * 2], y = joints[i * 2 + 1];
+        if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) {
+          oobJoints.add('${allJ[i].name}(${x.toStringAsFixed(3)},${y.toStringAsFixed(3)})');
+        }
+      }
+      if (oobJoints.isNotEmpty) debugPrint('[Tick] WARNING: joints out of [0,1]: ${oobJoints.join(', ')}');
     }
 
     // LBS deformation
     final newJoints = s.rig.getJoints2DPositions();
+    // Joint bounds check — every tick, log only when something is wrong
+    {
+      final allJ = s.rig.root.allJoints;
+      for (int i = 0; i < allJ.length; i++) {
+        final x = newJoints[i * 2], y = newJoints[i * 2 + 1];
+        if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) {
+          debugPrint('[Tick #$_tickCount] WARNING: joint "${allJ[i].name}" out of bounds (${x.toStringAsFixed(3)},${y.toStringAsFixed(3)})');
+        }
+      }
+    }
     final newVerts = s.lbs.solve(newJoints);
     if (log) {
       debugPrint('[Tick]   LBS → ${newVerts.length ~/ 2} verts  [0]=(${newVerts[0].toStringAsFixed(3)},${newVerts[1].toStringAsFixed(3)})');
