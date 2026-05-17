@@ -2,14 +2,14 @@
 // Reference: Igarashi & Igarashi, "Implementing As-Rigid-As-Possible Shape
 // Manipulation and Surface Flattening", JGT 2009.
 //
-// Linear systems are solved via precomputed Cholesky inverses (ml_linalg),
-// matching Python's scipy.sparse.linalg.spsolve behaviour without iterative CG.
+// Solve path: Preconditioned Conjugate Gradient (PCG) with Jacobi
+// preconditioner and warm-starting between frames.
+// Init is O(nnz) instead of the old O(V³) Cholesky inversion.
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:ml_linalg/linalg.dart';
 
-// ─── Sparse matrix (CSR) — used only during build for matrix assembly ─────────
+// ─── Sparse matrix (CSR) ──────────────────────────────────────────────────────
 
 class _Csr {
   final int rows, cols;
@@ -47,9 +47,20 @@ class _Csr {
     return _Csr(rows, cols, rowPtr, colIdx, vals);
   }
 
-  /// y = A * x
-  Float64List matvec(Float64List x) {
-    final y = Float64List(rows);
+  /// Extract main diagonal.
+  Float64List diagonal() {
+    final d = Float64List(math.min(rows, cols));
+    for (int r = 0; r < d.length; r++) {
+      for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) {
+        if (colIdx[p] == r) { d[r] = vals[p]; break; }
+      }
+    }
+    return d;
+  }
+
+  /// y = A * x  (writes into [out] if provided, otherwise allocates)
+  Float64List matvec(Float64List x, [Float64List? out]) {
+    final y = out ?? Float64List(rows);
     for (int r = 0; r < rows; r++) {
       double s = 0;
       for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) {
@@ -95,18 +106,6 @@ class _Csr {
     }
     return _Csr.fromCoo(rows, cols, entries);
   }
-
-  /// Convert to ml_linalg dense Matrix (float64).
-  Matrix toDense() {
-    final flat = List<List<double>>.generate(
-        rows, (r) => List<double>.filled(cols, 0.0));
-    for (int r = 0; r < rows; r++) {
-      for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) {
-        flat[r][colIdx[p]] = vals[p];
-      }
-    }
-    return Matrix.fromList(flat, dtype: DType.float64);
-  }
 }
 
 // ─── Barycentric helpers ──────────────────────────────────────────────────────
@@ -131,25 +130,31 @@ List<double> _barycentricCoords(double px, double py, double ax, double ay,
 // ─── ARAP solver ─────────────────────────────────────────────────────────────
 
 /// As-Rigid-As-Possible mesh deformation.
-/// Precomputes Cholesky inverses of the two SPD system matrices at build time,
-/// then solves each frame with two dense matrix-vector multiplies — no CG, no
-/// convergence issues, exact match to Python's spsolve behaviour.
+/// Precomputes sparse normal-equation matrices (O(nnz), fast).
+/// Per-frame solve uses PCG with Jacobi preconditioning and warm-starting
+/// so subsequent frames typically converge in 1–5 iterations.
 class ArapSolver {
   static const double _w = 1000.0;
-
   final int numVertices;
   final int numJoints;
   final int _edgeNum;
 
   final Float64List _origVerts;
   final Float64List _edgeVectors;
-  final _Csr _tA1; // [2V × 2*(E+J)]  — RHS of step-1
-  final _Csr _tA2; // [V  × (E+J)]    — RHS of step-2
-  final _Csr _rotG; // [2E × 2V]       — rotation extraction
+  final _Csr _tA1;    // [2V × 2*(E+Jv)]  — step-1 RHS operator
+  final _Csr _tA2;    // [V  × (E+Jv)]    — step-2 RHS operator
+  final _Csr _rotG;   // [2E × 2V]        — rotation extraction
+  final _Csr _normA1; // tA1ᵀA1 + ε·I, (2V)×(2V) SPD
+  final _Csr _normA2; // tA2ᵀA2 + ε·I,  V×V  SPD
 
-  // Precomputed dense inverses — solve is a single matrix-vector multiply.
-  final Matrix _invA1; // (2V)×(2V) = inverse of tA1ᵀ A1
-  final Matrix _invA2; // V×V        = inverse of tA2ᵀ A2
+  // Jacobi preconditioner diagonals (inverted: 1/d[i])
+  final Float64List _invDiagA1;
+  final Float64List _invDiagA2;
+
+  // Warm-start buffers — updated after each solve
+  Float64List _warmV1  = Float64List(0);
+  Float64List _warmV2x = Float64List(0);
+  Float64List _warmV2y = Float64List(0);
 
   final List<int> _validPinOrigIdx;
 
@@ -162,8 +167,10 @@ class ArapSolver {
     required _Csr tA1,
     required _Csr tA2,
     required _Csr rotG,
-    required Matrix invA1,
-    required Matrix invA2,
+    required _Csr normA1,
+    required _Csr normA2,
+    required Float64List invDiagA1,
+    required Float64List invDiagA2,
     required List<int> validPinOrigIdx,
   })  : _edgeNum = edgeNum,
         _origVerts = origVerts,
@@ -171,8 +178,10 @@ class ArapSolver {
         _tA1 = tA1,
         _tA2 = tA2,
         _rotG = rotG,
-        _invA1 = invA1,
-        _invA2 = invA2,
+        _normA1 = normA1,
+        _normA2 = normA2,
+        _invDiagA1 = invDiagA1,
+        _invDiagA2 = invDiagA2,
         _validPinOrigIdx = validPinOrigIdx;
 
   factory ArapSolver({
@@ -381,21 +390,28 @@ class ArapSolver {
 
     final tA1 = csrA1.transpose();
     final tA2 = csrA2.transpose();
-    final tA1xA1 = tA1.multiply(csrA1).addDiag(1e-8);
-    final tA2xA2 = tA2.multiply(csrA2).addDiag(1e-8);
+    final normA1 = tA1.multiply(csrA1).addDiag(1e-8);
+    final normA2 = tA2.multiply(csrA2).addDiag(1e-8);
 
     debugPrint('[ARAP] build: V=$V E=$E J=$J validJ=$Jv '
-        'nnz(tA1xA1)=${tA1xA1.nnz} nnz(tA2xA2)=${tA2xA2.nnz}');
+        'nnz(normA1)=${normA1.nnz} nnz(normA2)=${normA2.nnz}');
 
-    // ── Precompute dense Cholesky inverses ────────────────────────────────────
-    // These are the only matrices we need at solve time; both are SPD.
-    // invA1 is (2V)×(2V), invA2 is V×V.
-    debugPrint('[ARAP] inverting tA1xA1 (${2*V}×${2*V})…');
-    final invA1 = tA1xA1.toDense().inverse(Inverse.cholesky);
-    debugPrint('[ARAP] inverting tA2xA2 (${V}×${V})…');
-    final invA2 = tA2xA2.toDense().inverse(Inverse.cholesky);
-    debugPrint('[ARAP] inverses ready');
+    // ── Jacobi preconditioner diagonals ──────────────────────────────────────
+    final diagA1Raw = normA1.diagonal();
+    final diagA2Raw = normA2.diagonal();
+    final invDiagA1 = Float64List(diagA1Raw.length);
+    final invDiagA2 = Float64List(diagA2Raw.length);
+    for (int i = 0; i < invDiagA1.length; i++) {
+      invDiagA1[i] = diagA1Raw[i] > 1e-14 ? 1.0 / diagA1Raw[i] : 1.0;
+    }
+    for (int i = 0; i < invDiagA2.length; i++) {
+      invDiagA2[i] = diagA2Raw[i] > 1e-14 ? 1.0 / diagA2Raw[i] : 1.0;
+    }
 
+    // ── PCG convergence diagnostic ────────────────────────────────────────────
+    _diagnosePCG('normA2', normA2, invDiagA2);
+
+    debugPrint('[ARAP] build complete');
     return ArapSolver._(
       numVertices: V,
       numJoints: J,
@@ -405,8 +421,10 @@ class ArapSolver {
       tA1: tA1,
       tA2: tA2,
       rotG: csrG,
-      invA1: invA1,
-      invA2: invA2,
+      normA1: normA1,
+      normA2: normA2,
+      invDiagA1: invDiagA1,
+      invDiagA2: invDiagA2,
       validPinOrigIdx: validPinOrigIdx,
     );
   }
@@ -419,7 +437,9 @@ class ArapSolver {
   Float32List solve(Float32List newJoints) {
     final E  = _edgeNum;
     final Jv = _validPinOrigIdx.length;
-    final logThis = (_solveCount++ % 60) == 0;
+    final logThis = (_solveCount % 60) == 0;
+    final isFirst = _solveCount == 0;
+    _solveCount++;
 
     // ── Step 1: find initial deformation (rotation + scale free) ─────────────
     final b1 = Float64List(2 * (E + Jv));
@@ -428,9 +448,14 @@ class ArapSolver {
       b1[2 * E + 2 * pj]     = _w * newJoints[oi * 2];
       b1[2 * E + 2 * pj + 1] = _w * newJoints[oi * 2 + 1];
     }
-    // v1 = (tA1xA1)^{-1} * tA1 * b1
+    // solve normA1 * v1 = tA1 * b1
     final rhs1 = _tA1.matvec(b1);
-    final v1   = _denseMatvec(_invA1, rhs1);
+    final v1 = _pcgSolve(
+      _normA1, _invDiagA1, rhs1,
+      x0: _warmV1.length == rhs1.length ? _warmV1 : null,
+      logLabel: isFirst ? 'step1-cold' : null,
+    );
+    _warmV1 = v1;
 
     if (logThis) {
       double v1min = double.infinity, v1max = double.negativeInfinity;
@@ -457,9 +482,21 @@ class ArapSolver {
       b2x[E + pj] = _w * newJoints[oi * 2];
       b2y[E + pj] = _w * newJoints[oi * 2 + 1];
     }
-    // v2x/y = (tA2xA2)^{-1} * tA2 * b2x/y
-    final v2x = _denseMatvec(_invA2, _tA2.matvec(b2x));
-    final v2y = _denseMatvec(_invA2, _tA2.matvec(b2y));
+    // solve normA2 * v2x = tA2 * b2x  (and same for y)
+    final rhs2x = _tA2.matvec(b2x);
+    final rhs2y = _tA2.matvec(b2y);
+    final v2x = _pcgSolve(
+      _normA2, _invDiagA2, rhs2x,
+      x0: _warmV2x.length == rhs2x.length ? _warmV2x : null,
+      logLabel: isFirst ? 'step2x-cold' : null,
+    );
+    final v2y = _pcgSolve(
+      _normA2, _invDiagA2, rhs2y,
+      x0: _warmV2y.length == rhs2y.length ? _warmV2y : null,
+      logLabel: isFirst ? 'step2y-cold' : null,
+    );
+    _warmV2x = v2x;
+    _warmV2y = v2y;
 
     final result = Float32List(numVertices * 2);
     for (int vi = 0; vi < numVertices; vi++) {
@@ -483,18 +520,140 @@ class ArapSolver {
   }
 }
 
-/// Dense matrix-vector product: returns M * v as Float64List.
-/// Uses ml_linalg internally but avoids per-element boxing overhead by
-/// extracting a row at a time via the row iterator.
-Float64List _denseMatvec(Matrix M, Float64List v) {
-  final rows = M.rowCount;
-  final cols = M.columnCount;
-  assert(cols == v.length);
-  final result = Float64List(rows);
-  // Build a Vector from v once; ml_linalg dot product is SIMD-accelerated.
-  final vVec = Vector.fromList(v, dtype: DType.float64);
-  for (int r = 0; r < rows; r++) {
-    result[r] = M.getRow(r).dot(vVec);
+// ─── PCG solver ──────────────────────────────────────────────────────────────
+
+/// Solves A·x = b using Preconditioned CG with Jacobi preconditioner M = diag(A).
+/// [invDiag] is the pre-inverted diagonal (1/d[i]).
+/// [x0] is optional warm-start vector (must have same length as b).
+/// [logLabel] if non-null, logs iteration count after solving.
+Float64List _pcgSolve(
+  _Csr A,
+  Float64List invDiag,
+  Float64List b, {
+  Float64List? x0,
+  int maxIter = 500,
+  double tol = 1e-9,
+  String? logLabel,
+}) {
+  final n = A.rows;
+  assert(n == b.length && n == invDiag.length);
+
+  final x  = Float64List(n);
+  final r  = Float64List(n);
+  final z  = Float64List(n);
+  final p  = Float64List(n);
+  final ap = Float64List(n);
+
+  // Initialise x from warm start
+  if (x0 != null) {
+    for (int i = 0; i < n; i++) x[i] = x0[i];
   }
-  return result;
+
+  // r = b - A·x
+  A.matvec(x, ap); // ap = A·x0 (temporary)
+  double bNorm2 = 0;
+  for (int i = 0; i < n; i++) {
+    r[i] = b[i] - ap[i];
+    bNorm2 += b[i] * b[i];
+  }
+
+  if (bNorm2 < 1e-30) return x; // trivial
+
+  final tolSq = tol * tol * bNorm2;
+
+  // z = M^{-1} · r
+  for (int i = 0; i < n; i++) z[i] = invDiag[i] * r[i];
+  for (int i = 0; i < n; i++) p[i] = z[i];
+  double rz = _dot64(r, z);
+
+  int iters = 0;
+  for (int iter = 1; iter <= maxIter; iter++) {
+    A.matvec(p, ap);
+    final pap = _dot64(p, ap);
+    if (pap.abs() < 1e-30) break;
+    final alpha = rz / pap;
+    double res2 = 0;
+    for (int i = 0; i < n; i++) {
+      x[i] += alpha * p[i];
+      r[i] -= alpha * ap[i];
+      res2 += r[i] * r[i];
+    }
+    iters = iter;
+    if (res2 <= tolSq) break;
+    for (int i = 0; i < n; i++) z[i] = invDiag[i] * r[i];
+    final newRz = _dot64(r, z);
+    if (rz.abs() < 1e-30) break;
+    final beta = newRz / rz;
+    for (int i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+    rz = newRz;
+  }
+
+  if (logLabel != null) {
+    debugPrint('[PCG $logLabel] converged in $iters/${maxIter} iters');
+  }
+  return x;
+}
+
+// ─── PCG diagnostic ───────────────────────────────────────────────────────────
+
+/// Verifies PCG convergence on A·x = A·ones (exact solution x*=ones).
+/// Logs relative residual and error vs exact at key iterations.
+void _diagnosePCG(String label, _Csr A, Float64List invDiag) {
+  final n = A.rows;
+  final ones = Float64List(n)..fillRange(0, n, 1.0);
+  final b = A.matvec(ones);
+
+  double bNorm2 = 0;
+  for (int i = 0; i < n; i++) bNorm2 += b[i] * b[i];
+
+  final x  = Float64List(n);
+  final r  = Float64List.fromList(b); // r = b - A·0 = b
+  final z  = Float64List(n);
+  final p  = Float64List(n);
+  final ap = Float64List(n);
+
+  for (int i = 0; i < n; i++) z[i] = invDiag[i] * r[i];
+  for (int i = 0; i < n; i++) p[i] = z[i];
+  double rz = _dot64(r, z);
+
+  for (int iter = 1; iter <= 500; iter++) {
+    A.matvec(p, ap);
+    final pap = _dot64(p, ap);
+    if (pap.abs() < 1e-30) break;
+    final alpha = rz / pap;
+    double res2 = 0;
+    for (int i = 0; i < n; i++) {
+      x[i] += alpha * p[i];
+      r[i] -= alpha * ap[i];
+      res2 += r[i] * r[i];
+    }
+    for (int i = 0; i < n; i++) z[i] = invDiag[i] * r[i];
+    final newRz = _dot64(r, z);
+    if (rz.abs() < 1e-30) break;
+    final beta = newRz / rz;
+    for (int i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+    rz = newRz;
+
+    final logIter = iter == 1 || iter == 5 || iter == 10 || iter % 20 == 0;
+    if (logIter || res2 < 1e-20 * bNorm2) {
+      double err2 = 0;
+      for (int i = 0; i < n; i++) {
+        final d = x[i] - 1.0;
+        err2 += d * d;
+      }
+      debugPrint('[PCG diag $label] iter=$iter'
+          '  rel_res=${math.sqrt(res2 / bNorm2).toStringAsExponential(3)}'
+          '  err_vs_exact=${math.sqrt(err2 / n).toStringAsExponential(3)}');
+      if (res2 < 1e-20 * bNorm2) {
+        debugPrint('[PCG diag $label] converged at iter=$iter');
+        break;
+      }
+    }
+  }
+}
+
+double _dot64(Float64List a, Float64List b) {
+  double s = 0;
+  for (int i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
 }
