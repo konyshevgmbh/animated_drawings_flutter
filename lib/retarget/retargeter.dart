@@ -61,9 +61,9 @@ class Retargeter {
   Future<void> _init(MotionConfig motionCfg, RetargetConfig retargetCfg) async {
     debugPrint('[Retargeter] _init  bvh=${motionCfg.bvhPath}');
 
-    // Load BVH
+    // Load BVH (inline content takes priority over asset path)
     debugPrint('[Retargeter] step 1 — load BVH asset');
-    final bvhContent = await rootBundle.loadString(motionCfg.bvhPath);
+    final bvhContent = motionCfg.bvhContent ?? await rootBundle.loadString(motionCfg.bvhPath);
     _bvh = BvhData.fromString(
       bvhContent,
       motionCfg.bvhPath.split('/').last,

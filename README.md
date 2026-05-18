@@ -29,6 +29,14 @@ Character detection and segmentation is powered by a YOLOv8 model trained on a d
 
 - [konyshevgmbh/animated_drawings_yolov8](https://github.com/konyshevgmbh/animated_drawings_yolov8)
 
+## Custom BVH Motions
+
+You can load your own BVH motion capture files via the **Custom BVH…** button in the motion selector. The app automatically detects the skeleton format (CMU, Rokoko/Mixamo, FAIR).
+
+A curated collection of CMU Motion Capture clips in BVH format is available at:
+
+- [konyshevgmbh/cmu-mocap](https://github.com/konyshevgmbh/cmu-mocap) — use [INDEX.md](https://github.com/konyshevgmbh/cmu-mocap/blob/master/INDEX.md) to browse and find the motion you need.
+
 ## Tech Stack
 
 - Flutter — cross-platform UI

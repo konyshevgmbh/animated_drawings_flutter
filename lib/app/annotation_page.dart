@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -70,7 +71,12 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
   // Layout
   Size _viewSize = Size.zero;
-  int _selectedMotion = 0;
+  int _selectedMotion = 0; // _motions.length → custom BVH
+
+  // Custom BVH
+  String? _customBvhContent;
+  String _customBvhFileName = '';
+  String _customBvhFormat = 'fair1'; // auto-detected: fair1 | cmu1 | cmu_una | rokoko
 
   PoseEstimator? _estimator;
 
@@ -83,6 +89,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
   @override
   void dispose() {
     _estimator?.dispose();
+
     super.dispose();
   }
 
@@ -343,11 +350,32 @@ class _AnnotationPageState extends State<AnnotationPage> {
       await File(_maskPath!).writeAsBytes(maskBytes);
     }
 
-    final (_, motionAsset, retargetAsset) = _motions[_selectedMotion];
-    final motionYaml = await rootBundle.loadString(motionAsset);
-    final retargetYaml = await rootBundle.loadString(retargetAsset);
-    final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
-    final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
+    MotionConfig motionCfg;
+    RetargetConfig retargetCfg;
+
+    if (_selectedMotion == _motions.length) {
+      // Custom BVH
+      if (_customBvhContent == null) return;
+      motionCfg = MotionConfig.fromCustomBvh(
+        bvhContent: _customBvhContent!,
+        fileName: _customBvhFileName,
+        format: _customBvhFormat,
+      );
+      const retargetMap = {
+        'fair1':   'assets/config/retarget/fair1_ppf.yaml',
+        'cmu1':    'assets/config/retarget/cmu1_pfp.yaml',
+        'cmu_una': 'assets/config/retarget/cmu_una_pfp.yaml',
+        'rokoko':  'assets/config/retarget/mixamo_fff.yaml',
+      };
+      final retargetYaml = await rootBundle.loadString(retargetMap[_customBvhFormat]!);
+      retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
+    } else {
+      final (_, motionAsset, retargetAsset) = _motions[_selectedMotion];
+      final motionYaml = await rootBundle.loadString(motionAsset);
+      final retargetYaml = await rootBundle.loadString(retargetAsset);
+      motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
+      retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
+    }
 
     if (!mounted) return;
     Navigator.push(
@@ -530,32 +558,99 @@ class _AnnotationPageState extends State<AnnotationPage> {
   }
 
   Widget _buildMotionPanel() {
+    final isCustom = _selectedMotion == _motions.length;
     return Padding(
       padding: const EdgeInsets.all(12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text('Select motion:'),
           const SizedBox(height: 8),
           Wrap(
             spacing: 8,
-            children: List.generate(_motions.length, (i) {
-              return ChoiceChip(
+            runSpacing: 4,
+            children: [
+              ...List.generate(_motions.length, (i) => ChoiceChip(
                 label: Text(_motions[i].$1),
                 selected: _selectedMotion == i,
                 onSelected: (_) => setState(() => _selectedMotion = i),
-              );
-            }),
+              )),
+              ChoiceChip(
+                label: Text(
+                  isCustom && _customBvhContent != null
+                      ? _customBvhFileName
+                      : 'Custom BVH…',
+                ),
+                selected: isCustom,
+                onSelected: (_) {
+                  setState(() => _selectedMotion = _motions.length);
+                  _pickCustomBvh();
+                },
+              ),
+            ],
           ),
+          if (isCustom && _customBvhContent != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              'Detected: ${_formatLabel(_customBvhFormat)}',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            ),
+          ],
           const SizedBox(height: 16),
           ElevatedButton.icon(
             icon: const Icon(Icons.play_arrow),
             label: const Text('Animate'),
-            onPressed: _onAnimate,
+            onPressed: (!isCustom || _customBvhContent != null) ? _onAnimate : null,
           ),
         ],
       ),
     );
+  }
+
+
+  Future<void> _pickCustomBvh() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['bvh'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    final bytes = file.bytes;
+    if (bytes == null) return;
+    final content = String.fromCharCodes(bytes);
+    final format = _detectBvhFormat(content);
+    setState(() {
+      _customBvhContent = content;
+      _customBvhFileName = file.name;
+      _customBvhFormat = format;
+    });
+  }
+
+  static String _formatLabel(String format) => switch (format) {
+    'cmu1'    => 'CMU MoCap',
+    'cmu_una' => 'CMU MoCap (una-dinosauria)',
+    'rokoko'  => 'Rokoko / Mixamo',
+    _         => 'Fair1 / FAIR',
+  };
+
+  static String _detectBvhFormat(String bvhContent) {
+    final joints = <String>{};
+    for (final line in bvhContent.split('\n')) {
+      final t = line.trim();
+      if (t.startsWith('ROOT ') || t.startsWith('JOINT ')) {
+        joints.add(t.split(' ').last);
+      }
+    }
+    // una-dinosauria CMU: hip proxy joint leads to LeftUpLeg-style legs
+    if (joints.contains('LHipJoint') && joints.contains('LeftUpLeg')) return 'cmu_una';
+    // Standard CMU: hip proxy joint with LeftHip/LeftAnkle naming
+    if (joints.contains('LeftHip') && joints.contains('LeftAnkle')) return 'cmu1';
+    // Rokoko / Mixamo: Spine2 present, no Spine3
+    if (joints.contains('Spine2') && !joints.contains('Spine3')) return 'rokoko';
+    // Fair1 / FAIR: fallback (up=+z, Spine3, or other FAIR-lab BVH)
+    return 'fair1';
   }
 }
 

@@ -2,6 +2,7 @@ import 'package:yaml/yaml.dart';
 
 class MotionConfig {
   final String bvhPath;     // asset path, e.g. 'assets/bvh/fair1/dab.bvh'
+  final String? bvhContent; // inline BVH text — bypasses asset loading when set
   final int startFrame;
   final int? endFrame; // null → use all frames
   final String groundplaneJoint;
@@ -12,6 +13,7 @@ class MotionConfig {
 
   const MotionConfig({
     required this.bvhPath,
+    this.bvhContent,
     required this.startFrame,
     this.endFrame,
     required this.groundplaneJoint,
@@ -20,6 +22,52 @@ class MotionConfig {
     required this.up,
     this.frameTime,
   });
+
+  /// Creates a MotionConfig for a user-supplied BVH file.
+  /// [format] is one of 'fair1', 'cmu1', 'rokoko'.
+  factory MotionConfig.fromCustomBvh({
+    required String bvhContent,
+    required String fileName,
+    required String format,
+    double? scaleOverride,
+  }) {
+    final presets = {
+      'fair1': (
+        up: '+z',
+        scale: 0.025,
+        groundplane: 'LeftFoot',
+        fwd: [['LeftShoulder', 'RightShoulder'], ['LeftUpLeg', 'RightUpLeg']],
+      ),
+      'cmu1': (
+        up: '+y',
+        scale: 0.025,
+        groundplane: 'LeftAnkle',
+        fwd: [['LeftShoulder', 'RightShoulder'], ['LeftHip', 'RightHip']],
+      ),
+      'rokoko': (
+        up: '+y',
+        scale: 0.005,
+        groundplane: 'LeftFoot',
+        fwd: [['LeftShoulder', 'RightShoulder'], ['LeftUpLeg', 'RightUpLeg']],
+      ),
+      'cmu_una': (
+        up: '+y',
+        scale: 0.025,
+        groundplane: 'LeftFoot',
+        fwd: [['LeftShoulder', 'RightShoulder'], ['LeftUpLeg', 'RightUpLeg']],
+      ),
+    };
+    final p = presets[format] ?? presets['fair1']!;
+    return MotionConfig(
+      bvhPath: 'custom/$fileName',
+      bvhContent: bvhContent,
+      startFrame: 0,
+      groundplaneJoint: p.groundplane,
+      forwardPerpJointVectors: p.fwd,
+      scale: scaleOverride ?? p.scale,
+      up: p.up,
+    );
+  }
 
   factory MotionConfig.fromYamlString(String content, String assetPrefix) {
     final doc = loadYaml(content) as YamlMap;
