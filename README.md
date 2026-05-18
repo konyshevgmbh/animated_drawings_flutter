@@ -4,6 +4,10 @@
   <img src="example_input.png" alt="Hand-drawn character" height="220"/>
   &nbsp;&nbsp;&nbsp;
   <img src="example_animation.gif" alt="Animated result" height="220"/>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="example_girl.png" alt="Hand-drawn character 2" height="220"/>
+  &nbsp;&nbsp;&nbsp;
+  <img src="example_girl_animation.gif" alt="Animated result 2" height="220"/>
 </p>
 
 A Flutter application that brings hand-drawn characters to life using computer vision and pose estimation.
