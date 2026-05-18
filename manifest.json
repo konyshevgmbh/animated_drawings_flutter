@@ -1,11 +1,11 @@
 {
-    "name": "flutter_animated_drawings",
-    "short_name": "flutter_animated_drawings",
+    "name": "Animaka",
+    "short_name": "Animaka",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Bring your hand-drawn characters to life.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
