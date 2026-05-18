@@ -1,7 +1,6 @@
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -27,29 +26,27 @@ const _motions = [
 enum _EditMode { joints, mask }
 
 class AnnotationPage extends StatefulWidget {
-  final String? imagePath;       // set on native platforms
-  final Uint8List? imageBytes;   // set on web (or when bytes are pre-loaded)
+  final String? imagePath;
+  final Uint8List? imageBytes;
 
-  const AnnotationPage({
-    super.key,
-    this.imagePath,
-    this.imageBytes,
-  }) : assert(imagePath != null || imageBytes != null,
-              'Either imagePath or imageBytes must be provided');
+  const AnnotationPage({super.key, this.imagePath, this.imageBytes});
 
   @override
   State<AnnotationPage> createState() => _AnnotationPageState();
 }
 
 class _AnnotationPageState extends State<AnnotationPage> {
+  // Current image source (mutable — updated when user picks a new image)
+  String? _currentImagePath;
+  Uint8List? _currentImageBytes;
+
   // Loading
   bool _loading = true;
   String _status = 'Loading image…';
   double _progress = 0.0;
 
-  // Annotation results (always available after load)
+  // Annotation results
   Uint8List? _textureBytes;
-  String? _texturePath; // native only
   String? _maskPath;    // native only
   int _imgW = 0;
   int _imgH = 0;
@@ -76,20 +73,21 @@ class _AnnotationPageState extends State<AnnotationPage> {
   // Custom BVH
   String? _customBvhContent;
   String _customBvhFileName = '';
-  String _customBvhFormat = 'fair1'; // auto-detected: fair1 | cmu1 | cmu_una | rokoko
+  String _customBvhFormat = 'fair1';
 
   PoseEstimator? _estimator;
 
   @override
   void initState() {
     super.initState();
+    _currentImagePath = widget.imagePath;
+    _currentImageBytes = widget.imageBytes;
     _runAnnotation();
   }
 
   @override
   void dispose() {
     _estimator?.dispose();
-
     super.dispose();
   }
 
@@ -116,10 +114,11 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
   Future<void> _runAnnotation() async {
     try {
-      if (kIsWeb) {
-        await _runAnnotationWeb();
-      } else {
+      if (!kIsWeb && _currentImagePath != null) {
         await _runAnnotationNative();
+      } else {
+        final bytes = _currentImageBytes ?? await _loadSampleBytes();
+        await _runAnnotationWithBytes(bytes);
       }
     } catch (e, st) {
       debugPrint('[Ann] ERROR: $e\n$st');
@@ -127,11 +126,15 @@ class _AnnotationPageState extends State<AnnotationPage> {
     }
   }
 
-  // Web: everything on main thread, no dart:io file I/O
-  Future<void> _runAnnotationWeb() async {
+  Future<Uint8List> _loadSampleBytes() async {
+    final data = await rootBundle.load('assets/sample.png');
+    return data.buffer.asUint8List();
+  }
+
+  // In-memory path: works for web, asset loading, and picked-file bytes
+  Future<void> _runAnnotationWithBytes(Uint8List rawBytes) async {
     _setStatus('Decoding image…', progress: 0.05);
 
-    final rawBytes = widget.imageBytes!;
     var image = img.decodeImage(rawBytes);
     if (image == null) throw Exception('Cannot decode image');
 
@@ -148,7 +151,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     _setStatus('Segmenting…', progress: 0.20);
     final maskDataRaw = segmentImage(image);
 
-    // Build RGBA texture image
     final rgba = img.Image(width: w, height: h, numChannels: 4);
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
@@ -157,7 +159,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
       }
     }
 
-    // Build mask image for pose estimation
     final maskImgRaw = img.Image(width: w, height: h);
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
@@ -189,7 +190,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
     }
   }
 
-  // Native: use isolate for segmentation, file I/O for temp storage
+  // Isolate path: uses file path for background segmentation (native only)
   Future<void> _runAnnotationNative() async {
     final tmpDir = await getTemporaryDirectory();
     final outDir = '${tmpDir.path}/annotation_out';
@@ -197,7 +198,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
     _setStatus('Segmenting…', progress: 0.05);
     final port = ReceivePort();
-    await Isolate.spawn(_segmentIsolate, [widget.imagePath!, outDir, port.sendPort]);
+    await Isolate.spawn(_segmentIsolate, [_currentImagePath!, outDir, port.sendPort]);
 
     late final _SegResult segResult;
     await for (final msg in port) {
@@ -241,7 +242,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     if (mounted) {
       setState(() {
         _textureBytes = imageBytes;
-        _texturePath = segResult.texturePath;
         _maskPath = segResult.maskPath;
         _imgW = segResult.w;
         _imgH = segResult.h;
@@ -254,6 +254,119 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
   void _setStatus(String s, {double progress = -1}) {
     if (mounted) setState(() { _status = s; if (progress >= 0) _progress = progress; });
+  }
+
+  // ── Reload with a new image ────────────────────────────────────────────────
+
+  Future<void> _reloadAnnotation({String? path, Uint8List? bytes}) async {
+    _estimator?.dispose();
+    _estimator = null;
+    setState(() {
+      _loading = true;
+      _status = 'Loading image…';
+      _progress = 0.0;
+      _currentImagePath = path;
+      _currentImageBytes = bytes;
+      _textureBytes = null;
+      _maskPath = null;
+      _skeleton = [];
+      _maskData = Uint8List(0);
+      _imgW = 0;
+      _imgH = 0;
+      _selectedJointIdx = -1;
+      _editMode = _EditMode.joints;
+      _selectedMotion = 0;
+      _customBvhContent = null;
+    });
+    await _runAnnotation();
+  }
+
+  Future<void> _pickAndReloadImage() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: false,
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    final bytes = file.bytes;
+    if (bytes == null) return;
+    await _reloadAnnotation(
+      path: kIsWeb ? null : file.path,
+      bytes: bytes,
+    );
+  }
+
+  // Native only: load pre-annotated folder → go directly to AnimationPage
+  Future<void> _loadAnnotationFolder() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['yaml', 'yml'],
+      dialogTitle: 'Select char_cfg.yaml from annotation folder',
+      withData: false,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final cfgPath = result.files.first.path;
+    if (cfgPath == null) return;
+
+    final folder = File(cfgPath).parent.path;
+    final sep = Platform.pathSeparator;
+    final texturePath = '$folder${sep}texture.png';
+    final maskPath = '$folder${sep}mask.png';
+
+    if (!File(texturePath).existsSync() || !File(maskPath).existsSync()) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('texture.png or mask.png not found in folder')),
+      );
+      return;
+    }
+
+    final charCfgYaml = await File(cfgPath).readAsString();
+    CharConfig charCfg;
+    try {
+      charCfg = CharConfig.fromYamlString(charCfgYaml);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to parse char_cfg.yaml: $e')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final motionIdx = await _pickMotionDialog(context);
+    if (motionIdx == null) return;
+
+    final (_, motionAsset, retargetAsset) = _motions[motionIdx];
+    final motionYaml = await rootBundle.loadString(motionAsset);
+    final retargetYaml = await rootBundle.loadString(retargetAsset);
+    final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
+    final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
+
+    final textureBytes = await File(texturePath).readAsBytes();
+    final maskBytes = await File(maskPath).readAsBytes();
+
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AnimationPage(
+          charCfg: charCfg,
+          textureBytes: textureBytes,
+          maskBytes: maskBytes,
+          motionCfg: motionCfg,
+          retargetCfg: retargetCfg,
+        ),
+      ),
+    );
+  }
+
+  void _onMenuSelected(String value) {
+    switch (value) {
+      case 'open': _pickAndReloadImage();
+      case 'folder': _loadAnnotationFolder();
+    }
   }
 
   // ── Gesture handlers ───────────────────────────────────────────────────────
@@ -335,7 +448,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
     final charCfg = CharConfig(height: _imgH, width: _imgW, skeleton: _skeleton);
 
-    // Encode edited mask from _maskData to PNG bytes
     final maskImg = img.Image(width: _imgW, height: _imgH);
     for (int y = 0; y < _imgH; y++) {
       for (int x = 0; x < _imgW; x++) {
@@ -345,7 +457,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     }
     final maskBytes = Uint8List.fromList(img.encodePng(maskImg));
 
-    // On native, also persist the edited mask back to the temp file
     if (!kIsWeb && _maskPath != null) {
       await File(_maskPath!).writeAsBytes(maskBytes);
     }
@@ -354,7 +465,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     RetargetConfig retargetCfg;
 
     if (_selectedMotion == _motions.length) {
-      // Custom BVH
       if (_customBvhContent == null) return;
       motionCfg = MotionConfig.fromCustomBvh(
         bvhContent: _customBvhContent!,
@@ -397,7 +507,33 @@ class _AnnotationPageState extends State<AnnotationPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Annotation')),
+      appBar: AppBar(
+        title: const Text('Animated Drawings'),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: _onMenuSelected,
+            itemBuilder: (_) => [
+              const PopupMenuItem(
+                value: 'open',
+                child: ListTile(
+                  leading: Icon(Icons.image),
+                  title: Text('Open image…'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              if (!kIsWeb)
+                const PopupMenuItem(
+                  value: 'folder',
+                  child: ListTile(
+                    leading: Icon(Icons.folder_open),
+                    title: Text('Load annotation folder'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
       body: _loading ? _buildLoading() : _buildReady(),
     );
   }
@@ -608,7 +744,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     );
   }
 
-
   Future<void> _pickCustomBvh() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -643,13 +778,9 @@ class _AnnotationPageState extends State<AnnotationPage> {
         joints.add(t.split(' ').last);
       }
     }
-    // una-dinosauria CMU: hip proxy joint leads to LeftUpLeg-style legs
     if (joints.contains('LHipJoint') && joints.contains('LeftUpLeg')) return 'cmu_una';
-    // Standard CMU: hip proxy joint with LeftHip/LeftAnkle naming
     if (joints.contains('LeftHip') && joints.contains('LeftAnkle')) return 'cmu1';
-    // Rokoko / Mixamo: Spine2 present, no Spine3
     if (joints.contains('Spine2') && !joints.contains('Spine3')) return 'rokoko';
-    // Fair1 / FAIR: fallback (up=+z, Spine3, or other FAIR-lab BVH)
     return 'fair1';
   }
 }
@@ -928,4 +1059,33 @@ Future<void> _segmentIsolate(List<dynamic> args) async {
   } catch (e) {
     sendPort.send(Exception(e.toString()));
   }
+}
+
+// ─── Motion picker dialog (used by Load annotation folder) ───────────────────
+
+Future<int?> _pickMotionDialog(BuildContext context) {
+  int selected = 0;
+  return showDialog<int>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setState) => AlertDialog(
+        title: const Text('Select motion'),
+        content: RadioGroup<int>(
+          groupValue: selected,
+          onChanged: (v) => setState(() => selected = v!),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(_motions.length, (i) => RadioListTile<int>(
+              title: Text(_motions[i].$1),
+              value: i,
+            )),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(ctx, selected), child: const Text('OK')),
+        ],
+      ),
+    ),
+  );
 }

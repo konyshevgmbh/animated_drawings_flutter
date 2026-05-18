@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'home_page.dart';
+import 'annotation_page.dart';
 
 void main() {
   runApp(const AnimatedDrawingsApp());
@@ -16,7 +16,7 @@ class AnimatedDrawingsApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
-      home: const HomePage(),
+      home: const AnnotationPage(),
     );
   }
 }

@@ -27,6 +27,7 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/sample.png
     - assets/models/drawn_humanoid_pose.onnx
     - assets/bvh/cmu1/
     - assets/bvh/fair1/
