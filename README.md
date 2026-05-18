@@ -1,6 +1,16 @@
 # Animated Drawings Flutter
 
+<p align="center">
+  <img src="example_input.png" alt="Hand-drawn character" height="220"/>
+  &nbsp;&nbsp;&nbsp;
+  <img src="example_animation.gif" alt="Animated result" height="220"/>
+</p>
+
 A Flutter application that brings hand-drawn characters to life using computer vision and pose estimation.
+
+> **Note:** The animation quality depends heavily on the mesh triangulation.
+> It's worth experimenting with the grid density `N` and other parameters
+> in [`lib/mesh/triangulation.dart`](lib/mesh/triangulation.dart) for your specific drawings.
 
 ## About
 
