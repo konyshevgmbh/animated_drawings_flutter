@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -52,22 +51,20 @@ class AnimatedDrawingState {
 
 /// Loads and initializes all data needed for animation.
 Future<AnimatedDrawingState> buildAnimatedDrawingState({
-  required String texturePath,
-  required String maskPath,
+  required Uint8List textureBytes,
+  required Uint8List maskBytes,
   required CharConfig charCfg,
   required MotionConfig motionCfg,
   required RetargetConfig retargetCfg,
   void Function(double progress, String step)? onProgress,
 }) async {
   debugPrint('[AD] buildAnimatedDrawingState start');
-  debugPrint('[AD]   texturePath=$texturePath  maskPath=$maskPath');
   debugPrint('[AD]   imgDim=${charCfg.imgDim}  joints=${charCfg.skeleton.length}');
 
   // Load texture image and pad to square (portrait orientation, matching Python)
   onProgress?.call(0.02, 'Loading texture…');
   debugPrint('[AD] step 1/8 — load texture');
-  final texBytes = await File(texturePath).readAsBytes();
-  final texImg = img.decodeImage(texBytes)!;
+  final texImg = img.decodeImage(textureBytes)!;
   debugPrint('[AD]   raw texture: ${texImg.width}×${texImg.height}');
 
   final imgDim = charCfg.imgDim;
@@ -85,7 +82,6 @@ Future<AnimatedDrawingState> buildAnimatedDrawingState({
   // Load mask and pad to square (no rotation, matching Python)
   onProgress?.call(0.10, 'Loading mask…');
   debugPrint('[AD] step 2/8 — load mask');
-  final maskBytes = await File(maskPath).readAsBytes();
   final maskImg = img.decodeImage(maskBytes)!;
   debugPrint('[AD]   raw mask: ${maskImg.width}×${maskImg.height}');
   final paddedMask = img.Image(width: imgDim, height: imgDim);

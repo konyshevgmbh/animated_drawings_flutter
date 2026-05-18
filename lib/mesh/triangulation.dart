@@ -1,18 +1,12 @@
-import 'dart:math' show Point;
 import 'dart:typed_data';
-import 'dart:ui' show Offset;
 import 'package:flutter/foundation.dart' show debugPrint;
 
-import 'package:delaunay/delaunay.dart';
-
 import '../annotation/char_cfg.dart';
-import 'douglas_peucker.dart';
-import 'marching_squares.dart';
 
-/// Mesh vertex: normalized [0,1] coords + original pixel row,col for UV.
+/// Mesh vertex: normalized [0,1] coords used for both position and UV.
 class MeshVertex {
-  final double x; // normalized (mesh_col / img_dim)
-  final double y; // normalized (mesh_row / img_dim)
+  final double x;
+  final double y;
   const MeshVertex(this.x, this.y);
 }
 
@@ -30,134 +24,148 @@ class CharMesh {
   });
 }
 
-/// Port of animated_drawing.py:_generate_mesh() + _initialize_joint_to_triangles_dict().
-/// [maskData] – row-major Uint8List of size [imgDim × imgDim] (values 0 or 255).
-/// [imgDim]   – padded square size = max(height, width) of char image.
-/// [charCfg]  – skeleton joints in pixel coords.
+/// Grid-based mesh with boundary clipping — no Delaunay, works on all platforms.
+///
+/// The delaunay package uses 32×32-bit integer products in the in-circle test.
+/// On web (JS 53-bit float) those products overflow → sign flips non-deterministically
+/// → legalize loops forever even with jitter.
+///
+/// Algorithm:
+///   1. N×N grid; keep vertices whose mask pixel is > 0.
+///   2. For each cell split into 2 right-angle triangles.
+///      • All-inside cell  → add both triangles as-is (interior quality).
+///      • Boundary cell    → clip each triangle: outside vertices are replaced
+///        by midpoints of the crossing grid edge, giving a smooth boundary
+///        approximation at ½-cell resolution without any floating-point predicates.
+///   3. BFS joint-to-triangle mapping (unchanged).
 CharMesh buildMesh(Uint8List maskData, int imgDim, CharConfig charCfg) {
   debugPrint('[Mesh] buildMesh  imgDim=$imgDim  skeletonJoints=${charCfg.skeleton.length}');
 
-  // 1. Extract contour from mask
-  debugPrint('[Mesh] step 1 — marchingSquares');
-  final contour = marchingSquares(maskData, imgDim, imgDim);
-  if (contour.isEmpty) throw StateError('No contour found in mask');
-  debugPrint('[Mesh]   contour points=${contour.length}');
+  const int N = 40; // 40×40 grid → typically ~1000-1300 verts, ~1500-2000 tris
 
-  // 2. Simplify contour (tolerance=0.25 pixels)
-  debugPrint('[Mesh] step 2 — simplifyPolygon (tol=0.25)');
-  final simplified = simplifyPolygon(contour, 0.25);
-  debugPrint('[Mesh]   simplified points=${simplified.length}');
+  // ── 1. Grid vertices ────────────────────────────────────────────────────────
+  debugPrint('[Mesh] step 1 — $N×$N grid vertices');
+  final verts = <MeshVertex>[];
+  final gridIdx = List<int>.filled(N * N, -1); // -1 = outside mask
 
-  // 3. Interior grid: 40×40 points, keep those inside contour
-  debugPrint('[Mesh] step 3 — interior grid 40×40');
-  final inside = <Offset>[];
-  for (int i = 0; i < 40; i++) {
-    for (int j = 0; j < 40; j++) {
-      final p = Offset(imgDim * i / 39.0, imgDim * j / 39.0);
-      if (_pointInPolygon(p, simplified)) inside.add(p);
-    }
-  }
-  debugPrint('[Mesh]   interior points inside mask=${inside.length}');
-
-  // 4. Combine, deduplicating points within 0.5 px of each other.
-  //    Near-duplicate points produce machine-epsilon-area triangles that make
-  //    the ARAP step-2 system under-determined (zero-vector edge constraints
-  //    leave those vertices unconstrained → pulled to zero by the solver).
-  debugPrint('[Mesh] step 4 — deduplicate and combine points (merge radius 0.5 px)');
-  const double mergeDistSq = 0.5 * 0.5;
-  final allPts = <Offset>[...simplified];
-  int droppedNearDups = 0;
-  for (final p in inside) {
-    bool tooClose = false;
-    for (final existing in allPts) {
-      final dx = p.dx - existing.dx, dy = p.dy - existing.dy;
-      if (dx * dx + dy * dy < mergeDistSq) { tooClose = true; break; }
-    }
-    if (tooClose) { droppedNearDups++; } else { allPts.add(p); }
-  }
-  if (droppedNearDups > 0) {
-    debugPrint('[Mesh]   dropped $droppedNearDups near-duplicate interior points');
-  }
-  debugPrint('[Mesh] step 4 — total input points=${allPts.length} '
-      '(outline=${simplified.length} + interior=${allPts.length - simplified.length})');
-  final points = allPts.map((o) => Point<double>(o.dx, o.dy)).toList();
-
-  // 5. Delaunay triangulation
-  debugPrint('[Mesh] step 5 — Delaunay triangulation');
-  final tri = Delaunay.from(points);
-  tri.initialize();
-  tri.processAllPoints();
-  debugPrint('[Mesh]   raw triangles=${tri.triangles.length ~/ 3}');
-
-  // 6. Filter: keep triangles whose centroid is inside contour and are non-degenerate.
-  //    Degenerate triangles (area < 0.1 px²) produce zero-vector edges that
-  //    leave adjacent vertices unconstrained in the ARAP step-2 solve.
-  debugPrint('[Mesh] step 6 — filter triangles by centroid-in-contour and area');
-  final goodTris = <int>[];
-  int skippedDegenerate = 0;
-  for (int i = 0; i < tri.triangles.length; i += 3) {
-    final a = tri.getPoint(tri.triangles[i]);
-    final b = tri.getPoint(tri.triangles[i + 1]);
-    final c = tri.getPoint(tri.triangles[i + 2]);
-    // Area in pixel space — skip near-zero triangles
-    final area = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() * 0.5;
-    if (area < 0.1) { skippedDegenerate++; continue; }
-    final centroid = Offset(
-      (a.x + b.x + c.x) / 3,
-      (a.y + b.y + c.y) / 3,
-    );
-    if (_pointInPolygon(centroid, simplified)) {
-      goodTris.add(tri.triangles[i]);
-      goodTris.add(tri.triangles[i + 1]);
-      goodTris.add(tri.triangles[i + 2]);
-    }
-  }
-  if (skippedDegenerate > 0) {
-    debugPrint('[Mesh]   skipped $skippedDegenerate degenerate triangles (area<0.1 px²)');
-  }
-  debugPrint('[Mesh]   triangles after filter=${goodTris.length ~/ 3}');
-
-  // 7. Normalize vertices to [0,1]
-  final verts = allPts
-      .map((o) => MeshVertex(o.dx / imgDim, o.dy / imgDim))
-      .toList();
-
-  final triangles = Uint16List.fromList(goodTris);
-
-  // Diagnostic: empty mesh guard
-  if (goodTris.isEmpty) {
-    debugPrint('[Mesh] WARNING: no triangles survived centroid filter — mesh is empty!');
-  } else {
-    // Paranoia: verify Delaunay uses the original input ordering
-    final si = tri.triangles[0];
-    if (si >= 0 && si < allPts.length) {
-      final ep = allPts[si];
-      final gp = tri.getPoint(si);
-      if ((gp.x - ep.dx).abs() > 1.0 || (gp.y - ep.dy).abs() > 1.0) {
-        debugPrint('[Mesh] WARNING: Delaunay index-ordering mismatch at idx=$si — '
-            'allPts=(${ep.dx.toStringAsFixed(0)},${ep.dy.toStringAsFixed(0)}) '
-            'getPoint=(${gp.x.toStringAsFixed(0)},${gp.y.toStringAsFixed(0)})');
+  for (int j = 0; j < N; j++) {
+    for (int i = 0; i < N; i++) {
+      final nx = i / (N - 1.0);
+      final ny = j / (N - 1.0);
+      final px = (nx * (imgDim - 1)).round();
+      final py = (ny * (imgDim - 1)).round();
+      if (maskData[py * imgDim + px] > 0) {
+        gridIdx[j * N + i] = verts.length;
+        verts.add(MeshVertex(nx, ny));
       }
     }
-    // Count degenerate triangles (near-zero area in normalized [0,1] space)
-    int degCount = 0;
-    double minArea = double.infinity;
-    for (int i = 0; i < goodTris.length; i += 3) {
-      final a = verts[goodTris[i]], b = verts[goodTris[i + 1]], c = verts[goodTris[i + 2]];
-      final area = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() * 0.5;
-      if (area < 1e-8) degCount++;
-      if (area < minArea) minArea = area;
+  }
+  debugPrint('[Mesh]   grid verts inside mask=${verts.length}');
+  if (verts.isEmpty) throw StateError('No mask pixels found — check mask data');
+
+  // ── 2. Triangulate with boundary clipping ──────────────────────────────────
+  //
+  // For edges that cross the inside/outside boundary, we add a midpoint vertex
+  // (cached so shared edges reuse the same vertex).  Each grid cell then clips
+  // its two candidate triangles against the mask: outside corners are replaced
+  // by the midpoint of the edge where the boundary crosses, producing a smooth
+  // ½-cell-resolution approximation of the character outline.
+
+  // midCache key: canonical (lo, hi) of grid linear indices, packed as lo*N²+hi.
+  final midCache = <int, int>{};
+
+  int getMid(int i1, int j1, int i2, int j2) {
+    final k1 = i1 * N + j1;
+    final k2 = i2 * N + j2;
+    final lo = k1 < k2 ? k1 : k2;
+    final hi = k1 < k2 ? k2 : k1;
+    return midCache.putIfAbsent(lo * (N * N) + hi, () {
+      final nx = (i1 + i2) / (2.0 * (N - 1));
+      final ny = (j1 + j2) / (2.0 * (N - 1));
+      final idx = verts.length;
+      verts.add(MeshVertex(nx, ny));
+      return idx;
+    });
+  }
+
+  debugPrint('[Mesh] step 2 — triangulation with boundary clipping');
+  final triList = <int>[];
+
+  // Clip triangle (a,b,c).  Indices ≥ 0 = inside mask; -1 = outside.
+  // Grid coords (ai,aj) etc. are needed only to create midpoint vertices.
+  void clipTri(int a, int b, int c,
+               int ai, int aj, int bi, int bj, int ci, int cj) {
+    final aIn = a >= 0;
+    final bIn = b >= 0;
+    final cIn = c >= 0;
+    final cnt = (aIn ? 1 : 0) + (bIn ? 1 : 0) + (cIn ? 1 : 0);
+
+    if (cnt == 3) {
+      // Fully inside — add as-is.
+      triList.addAll([a, b, c]);
+    } else if (cnt == 2) {
+      // One corner outside — clipped quad → 2 triangles.
+      if (!aIn) {
+        final mab = getMid(ai, aj, bi, bj);
+        final mac = getMid(ai, aj, ci, cj);
+        triList.addAll([mab, b, c]);
+        triList.addAll([mab, c, mac]);
+      } else if (!bIn) {
+        final mab = getMid(ai, aj, bi, bj);
+        final mbc = getMid(bi, bj, ci, cj);
+        triList.addAll([a, mab, mbc]);
+        triList.addAll([a, mbc, c]);
+      } else {
+        // !cIn
+        final mac = getMid(ai, aj, ci, cj);
+        final mbc = getMid(bi, bj, ci, cj);
+        triList.addAll([a, b, mbc]);
+        triList.addAll([a, mbc, mac]);
+      }
+    } else if (cnt == 1) {
+      // Two corners outside — small triangle at the surviving corner.
+      if (aIn) {
+        final mab = getMid(ai, aj, bi, bj);
+        final mac = getMid(ai, aj, ci, cj);
+        triList.addAll([a, mab, mac]);
+      } else if (bIn) {
+        final mab = getMid(ai, aj, bi, bj);
+        final mbc = getMid(bi, bj, ci, cj);
+        triList.addAll([mab, b, mbc]);
+      } else {
+        final mac = getMid(ai, aj, ci, cj);
+        final mbc = getMid(bi, bj, ci, cj);
+        triList.addAll([mac, mbc, c]);
+      }
     }
-    if (degCount > 0) {
-      debugPrint('[Mesh] WARNING: $degCount/${goodTris.length ~/ 3} degenerate triangles '
-          '(area<1e-8)  minArea=${minArea.toStringAsExponential(2)}');
-    } else {
-      debugPrint('[Mesh] triangles OK  count=${goodTris.length ~/ 3}  minArea=${minArea.toStringAsExponential(2)}');
+    // cnt == 0: fully outside — skip.
+  }
+
+  for (int j = 0; j < N - 1; j++) {
+    for (int i = 0; i < N - 1; i++) {
+      final tl = gridIdx[j * N + i];
+      final tr = gridIdx[j * N + (i + 1)];
+      final bl = gridIdx[(j + 1) * N + i];
+      final br = gridIdx[(j + 1) * N + (i + 1)];
+
+      // Upper-left triangle: TL(i,j) – TR(i+1,j) – BL(i,j+1)
+      clipTri(tl, tr, bl, i, j, i + 1, j, i, j + 1);
+      // Lower-right triangle: TR(i+1,j) – BR(i+1,j+1) – BL(i,j+1)
+      clipTri(tr, br, bl, i + 1, j, i + 1, j + 1, i, j + 1);
     }
   }
 
-  // 8. BFS joint-to-triangle mapping
-  debugPrint('[Mesh] step 7 — BFS joint-to-triangle mapping');
+  debugPrint('[Mesh]   verts (grid + boundary midpoints)=${verts.length}');
+  debugPrint('[Mesh]   triangles=${triList.length ~/ 3}');
+
+  if (triList.isEmpty) {
+    debugPrint('[Mesh] WARNING: no triangles — mesh is empty!');
+  }
+
+  final triangles = Uint16List.fromList(triList);
+
+  // ── 3. BFS joint-to-triangle mapping ───────────────────────────────────────
+  debugPrint('[Mesh] step 3 — BFS joint-to-triangle mapping');
   final jointToTri = _buildJointToTriMap(maskData, imgDim, charCfg, verts, triangles);
   debugPrint('[Mesh]   jointToTri entries=${jointToTri.length}  keys: ${jointToTri.keys.take(5).join(", ")}');
 
@@ -173,8 +181,6 @@ Map<String, Uint16List> _buildJointToTriMap(
   final sw = Stopwatch()..start();
   final int cells = imgDim * imgDim;
 
-  // Use integer distances ×10: cardinal=10, diagonal=14 (≈√2×10).
-  // Bucket queue: array of lists indexed by distance, O(1) push/pop.
   const int kCard = 10, kDiag = 14;
   final shortestDist = Int32List(cells)..fillRange(0, cells, 0x7fffffff);
   final closestJoint = Int32List(cells)..fillRange(0, cells, -1);
@@ -184,8 +190,8 @@ Map<String, Uint16List> _buildJointToTriMap(
 
   debugPrint('[BFS] start  cells=$cells  joints=${joints.length}');
 
-  // Seed: 20 points per bone segment at dist=0
-  final seeds = <(int, int, int)>[]; // (ji, x, y)
+  // Seed: 20 sample points per bone segment
+  final seeds = <(int, int, int)>[];
   for (final joint in joints) {
     if (joint.parent == null) continue;
     final parent = joints.firstWhere((j) => j.name == joint.parent);
@@ -199,7 +205,6 @@ Map<String, Uint16List> _buildJointToTriMap(
   }
   debugPrint('[BFS] seeds=${seeds.length}');
 
-  // Bucket queue: max distance ≈ imgDim × 14 (diagonal across the image)
   final maxDist = imgDim * 15;
   final buckets = List<List<(int, int, int)>>.generate(maxDist, (_) => []);
 
@@ -222,7 +227,7 @@ Map<String, Uint16List> _buildJointToTriMap(
     if (bucket.isEmpty) continue;
     for (int bi = 0; bi < bucket.length; bi++) {
       final (ji, x, y) = bucket[bi];
-      if (shortestDist[y * imgDim + x] != dist) continue; // stale entry
+      if (shortestDist[y * imgDim + x] != dist) continue;
       processed++;
       for (int d = 0; d < 8; d++) {
         final nx = x + dx[d], ny = y + dy[d];
@@ -238,7 +243,6 @@ Map<String, Uint16List> _buildJointToTriMap(
   }
   debugPrint('[BFS] done  processed=$processed  elapsed=${sw.elapsedMilliseconds}ms');
 
-  // Map triangle centroids to closest joint
   final jointToTriVerts = <int, List<int>>{};
   for (int i = 0; i < triangles.length; i += 3) {
     final a = verts[triangles[i]];
@@ -255,20 +259,4 @@ Map<String, Uint16List> _buildJointToTriMap(
     for (final entry in jointToTriVerts.entries)
       joints[entry.key].name: Uint16List.fromList(entry.value),
   };
-}
-
-// ─── Point-in-polygon (ray casting) ───────────────────────────────────────
-
-bool _pointInPolygon(Offset pt, List<Offset> polygon) {
-  int crossings = 0;
-  final n = polygon.length;
-  for (int i = 0; i < n; i++) {
-    final a = polygon[i];
-    final b = polygon[(i + 1) % n];
-    if ((a.dy <= pt.dy && b.dy > pt.dy) || (b.dy <= pt.dy && a.dy > pt.dy)) {
-      final xIntersect = a.dx + (pt.dy - a.dy) / (b.dy - a.dy) * (b.dx - a.dx);
-      if (pt.dx < xIntersect) crossings++;
-    }
-  }
-  return crossings % 2 == 1;
 }

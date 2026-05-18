@@ -1,6 +1,7 @@
 import 'dart:io';
-
+import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
@@ -8,20 +9,20 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
 /// Captures [frameCount] frames from a [RepaintBoundary] key, encodes as GIF.
-/// Frame capture runs on the main thread; GIF encoding runs in a background isolate.
-Future<File> exportGif({
+/// On native: writes to [outputPath] and returns the path.
+/// On web: triggers a browser download and returns null.
+Future<String?> exportGif({
   required GlobalKey repaintKey,
   required int frameCount,
   required Future<void> Function(int frameIndex) onFrame,
   String? outputPath,
-  int delayCs = 4, // centiseconds per frame (GIF spec unit)
+  int delayCs = 4,
   double pixelRatio = 1.0,
-  int? bgArgb, // null = transparent
+  int? bgArgb,
 }) async {
   final rawFrames = <_RawFrame>[];
 
   for (int i = 0; i < frameCount; i++) {
-    // onFrame already waits for endOfFrame — no extra delay needed.
     await onFrame(i);
 
     final boundary = repaintKey.currentContext?.findRenderObject()
@@ -42,16 +43,22 @@ Future<File> exportGif({
     ));
   }
 
-  // Encode in a background isolate so the main thread stays free.
   final gifBytes = await compute(_encodeGif, _EncodeParams(frames: rawFrames, delayCs: delayCs, bgArgb: bgArgb));
   if (gifBytes == null) throw StateError('GIF encoding failed');
+
+  if (kIsWeb) {
+    await FilePicker.platform.saveFile(
+      fileName: 'animated_drawing.gif',
+      bytes: gifBytes,
+    );
+    return null;
+  }
 
   final outFile = outputPath != null
       ? File(outputPath)
       : File('${(await getApplicationDocumentsDirectory()).path}/animated_drawing.gif');
-
   await outFile.writeAsBytes(gifBytes);
-  return outFile;
+  return outFile.path;
 }
 
 // ─── Isolate-safe data classes ────────────────────────────────────────────────
@@ -70,7 +77,6 @@ class _EncodeParams {
   _EncodeParams({required this.frames, required this.delayCs, this.bgArgb});
 }
 
-// Top-level function required by compute().
 Uint8List? _encodeGif(_EncodeParams p) {
   final encoder = img.GifEncoder(repeat: 0);
   final delay = p.delayCs.clamp(1, 65535);

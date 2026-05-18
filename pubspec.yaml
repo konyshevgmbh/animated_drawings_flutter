@@ -10,9 +10,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  onnxruntime: ^1.0.0
+  flutter_onnxruntime: ^1.6.4
   image: ^4.2.0
-  delaunay: ^3.0.0
   vector_math: ^2.1.4
   yaml: ^3.1.2
   file_picker: ^8.0.0

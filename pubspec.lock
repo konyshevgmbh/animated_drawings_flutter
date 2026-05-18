@@ -65,14 +65,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.8"
-  delaunay:
-    dependency: "direct main"
-    description:
-      name: delaunay
-      sha256: "8e8d3e4ab511efd2f82bf4cf43f61b9232a7d93dd6d0024069b423a72e04f007"
-      url: "https://pub.dev"
-    source: hosted
-    version: "3.0.0"
   fake_async:
     dependency: transitive
     description:
@@ -110,6 +102,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "5.0.0"
+  flutter_onnxruntime:
+    dependency: "direct main"
+    description:
+      name: flutter_onnxruntime
+      sha256: bd415ae793558f008c6a2b5bc0ec3c4e2a872d8f536c845c34fbf0a726c2d6b9
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.7.1"
   flutter_plugin_android_lifecycle:
     dependency: transitive
     description:
@@ -192,14 +192,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.16.0"
-  onnxruntime:
-    dependency: "direct main"
-    description:
-      name: onnxruntime
-      sha256: e77ec05acafc135cc5fe7bcdf11b101b39f06513c9d5e9fa02cb1929f6bac72a
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.1"
   path:
     dependency: transitive
     description:

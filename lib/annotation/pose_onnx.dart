@@ -2,9 +2,8 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset;
 import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
-import 'package:onnxruntime/onnxruntime.dart';
 
 import '../annotation/char_cfg.dart';
 import '../annotation/straighten_legs.dart' as legs;
@@ -22,19 +21,14 @@ class PoseEstimator {
   OrtSession? _session;
 
   Future<void> init() async {
-    OrtEnv.instance.init();
-    final opts = OrtSessionOptions();
-    final bytes = await rootBundle.load(_modelAsset);
-    _session = OrtSession.fromBuffer(bytes.buffer.asUint8List(), opts);
+    _session = await OnnxRuntime().createSessionFromAsset(_modelAsset);
   }
 
   void dispose() {
-    _session?.release();
-    OrtEnv.instance.release();
+    _session?.close();
   }
 
   /// Returns COCO-17 keypoints in original image coords, or null if no pose found.
-  /// If [mask] is provided and original image yields no result, retries on mask silhouette.
   Future<List<Offset>?> estimate(img.Image image,
       {img.Image? mask, bool straightenLegs = false}) async {
     assert(_session != null, 'Call init() first');
@@ -43,7 +37,6 @@ class PoseEstimator {
 
     if (result == null && mask != null) {
       debugPrint('[Pose] no pose on original — retrying on mask silhouette...');
-      // Convert mask to RGB (white figure on black background)
       final maskRgb = img.Image(width: mask.width, height: mask.height);
       for (int y = 0; y < mask.height; y++) {
         for (int x = 0; x < mask.width; x++) {
@@ -71,7 +64,6 @@ class PoseEstimator {
     final resized = img.copyResize(image, width: rW, height: rH);
 
     // Build float tensor [1,3,640,640] RGB normalized [0,1]
-    // Pre-fill with YOLOv8 standard letterbox gray (114/255) — model trained with this padding
     const gray = 114.0 / 255.0;
     final tensor = Float32List(_inputSize * _inputSize * 3)
       ..fillRange(0, _inputSize * _inputSize * 3, gray);
@@ -91,55 +83,45 @@ class PoseEstimator {
 
     debugPrint('[Pose] $label: ${origW}x$origH → scale=$scale rW=$rW rH=$rH padX=$padX padY=$padY');
 
-    final inputTensor = OrtValueTensor.createTensorWithDataList(
+    final inputValue = await OrtValue.fromList(
       tensor,
       [1, 3, _inputSize, _inputSize],
     );
 
-    // Run inference once — output is deterministic for the same input.
-    final outputs = await _session!.runAsync(
-      OrtRunOptions(),
-      {'images': inputTensor},
-    );
+    Map<String, OrtValue?> outputs;
+    try {
+      outputs = await _session!.run({'images': inputValue});
+    } finally {
+      await inputValue.dispose();
+    }
 
-    // Output shape: [1, 56, 8400]
-    // 56 = 4 (box) + 1 (conf) + 17*3 (kpts x,y,conf)
-    final raw = (outputs?.first?.value as List?)?.first as List?;
+    // Output shape: [1, 56, 8400] — flattened to 1*56*8400
+    final outputKey = outputs.keys.firstOrNull;
+    Float32List? flat;
+    if (outputKey != null) {
+      final flatList = await outputs[outputKey]?.asFlattenedList();
+      if (flatList is Float32List) flat = flatList;
+      else if (flatList != null) flat = Float32List.fromList(flatList.cast<double>());
+    }
+    for (final v in outputs.values) { await v?.dispose(); }
+
+    if (flat == null) return null;
 
     List<Offset>? result;
-    if (raw != null) {
-      for (final conf in [0.25, 0.10, 0.05, 0.01]) {
-        result = _decodeOutput(raw, conf, origW, origH, scale, padX, padY, label);
-        if (result != null) break;
-      }
+    for (final conf in [0.25, 0.10, 0.05, 0.01]) {
+      result = _decodeOutput(flat, conf, origW, origH, scale, padX, padY, label);
+      if (result != null) break;
     }
-    for (final o in outputs ?? []) { o?.release(); }
-
-    inputTensor.release();
     return result;
   }
 
   List<Offset>? _decodeOutput(
-      List raw, double confThresh, int origW, int origH,
+      Float32List flat, double confThresh, int origW, int origH,
       double scale, int padX, int padY, String label) {
-    // raw is the [56, 8400] output (as nested list or flat)
-    final numDetections = 8400;
+    const numDetections = 8400;
     double bestConf = confThresh;
     int bestIdx = -1;
 
-    // raw may be List<List<double>> or flat - handle both
-    List<double> flat;
-    if (raw.first is List) {
-      flat = (raw as List<List>)
-          .expand((row) => row.cast<double>())
-          .toList();
-    } else {
-      flat = raw.cast<double>();
-    }
-
-    // Only consider detections whose box centre falls within the image content area
-    // (padX..padX+contentW, padY..padY+contentH) — the letterbox padding is black
-    // background and should never contain a valid pose.
     final contentW = (origW * scale).round();
     final contentH = (origH * scale).round();
     for (int i = 0; i < numDetections; i++) {
@@ -160,7 +142,6 @@ class PoseEstimator {
     final bh = flat[3 * numDetections + bestIdx];
     debugPrint('[Pose] $label: best detection conf=$bestConf idx=$bestIdx bh=${bh.toStringAsFixed(1)}');
 
-    // Extract 17 keypoints for best detection
     const names = ['nose','leye','reye','lear','rear','lsho','rsho',
                     'lelb','relb','lwri','rwri','lhip','rhip',
                     'lkne','rkne','lank','rank'];
@@ -179,14 +160,11 @@ class PoseEstimator {
       '${names[k]}=(${kpts[k].dx.toStringAsFixed(0)},${kpts[k].dy.toStringAsFixed(0)})').join(' ');
     debugPrint('[Pose] $label: $kpLog');
 
-    // Reject if too many keypoints fall outside the image area (clamped to edge)
     if (outOfBounds > 8) {
       debugPrint('[Pose] $label: $outOfBounds/17 keypoints out of bounds → rejecting');
       return null;
     }
 
-    // Reject if keypoint centroid is near the image edge — indicates detecting a
-    // sub-part (e.g. raised fist) rather than the full character body.
     final posOx = kpts.where((p) => p.dx > 0).map((p) => p.dx).toList();
     if (posOx.isNotEmpty) {
       final meanOx = posOx.reduce((a, b) => a + b) / posOx.length;
@@ -201,18 +179,14 @@ class PoseEstimator {
     return _fillMissingKpts(kpts, origW, origH);
   }
 
-  /// Fill zero (undetected) keypoints along limb chains by extrapolation or interpolation.
   List<Offset> _fillMissingKpts(List<Offset> kpts, int w, int h) {
     bool missing(int i) => kpts[i].dx == 0 && kpts[i].dy == 0;
 
-    // (grandparent, middle, endpoint, extrap_ratio, interp_t)
-    // extrap_ratio: endpoint = middle + (middle-grandparent) * ratio
-    // interp_t:     middle   = grandparent + (endpoint-grandparent) * t
     const chains = <(int, int, int, double, double)>[
-      (5,  7,  9,  0.90, 0.50),   // left:  shoulder → elbow → wrist
-      (6,  8,  10, 0.90, 0.50),   // right: shoulder → elbow → wrist
-      (11, 13, 15, 1.05, 0.50),   // left:  hip → knee → ankle
-      (12, 14, 16, 1.05, 0.50),   // right: hip → knee → ankle
+      (5,  7,  9,  0.90, 0.50),
+      (6,  8,  10, 0.90, 0.50),
+      (11, 13, 15, 1.05, 0.50),
+      (12, 14, 16, 1.05, 0.50),
     ];
 
     final filled = List<Offset>.from(kpts);
@@ -237,7 +211,6 @@ class PoseEstimator {
 }
 
 /// Build AnimatedDrawings skeleton from COCO-17 keypoints.
-/// Returns List[CharJoint] matching Python annotate_yolo.py:build_skeleton().
 List<CharJoint> buildSkeleton(List<Offset> kpts) {
   Offset pt(int idx) => kpts[idx];
   Offset midpt(int a, int b) => Offset(

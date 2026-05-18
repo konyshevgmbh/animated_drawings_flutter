@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
@@ -24,8 +26,15 @@ const _motions = [
 enum _EditMode { joints, mask }
 
 class AnnotationPage extends StatefulWidget {
-  final String imagePath;
-  const AnnotationPage({super.key, required this.imagePath});
+  final String? imagePath;       // set on native platforms
+  final Uint8List? imageBytes;   // set on web (or when bytes are pre-loaded)
+
+  const AnnotationPage({
+    super.key,
+    this.imagePath,
+    this.imageBytes,
+  }) : assert(imagePath != null || imageBytes != null,
+              'Either imagePath or imageBytes must be provided');
 
   @override
   State<AnnotationPage> createState() => _AnnotationPageState();
@@ -37,10 +46,10 @@ class _AnnotationPageState extends State<AnnotationPage> {
   String _status = 'Loading image…';
   double _progress = 0.0;
 
-  // Annotation results
+  // Annotation results (always available after load)
   Uint8List? _textureBytes;
-  String? _texturePath;
-  String? _maskPath;
+  String? _texturePath; // native only
+  String? _maskPath;    // native only
   int _imgW = 0;
   int _imgH = 0;
   List<CharJoint> _skeleton = [];
@@ -99,70 +108,140 @@ class _AnnotationPageState extends State<AnnotationPage> {
   // ── Annotation pipeline ────────────────────────────────────────────────────
 
   Future<void> _runAnnotation() async {
-    final tmpDir = await getTemporaryDirectory();
-    final outDir = '${tmpDir.path}/annotation_out';
-    await Directory(outDir).create(recursive: true);
-
     try {
-      _setStatus('Segmenting…', progress: 0.05);
-      final port = ReceivePort();
-      await Isolate.spawn(_segmentIsolate, [widget.imagePath, outDir, port.sendPort]);
-
-      late final _SegResult segResult;
-      await for (final msg in port) {
-        if (msg is String && msg.startsWith('status:')) {
-          _setStatus(msg.substring(7), progress: msg.contains('Segment') ? 0.20 : 0.05);
-        } else if (msg is _SegResult) {
-          segResult = msg;
-          port.close();
-          break;
-        } else if (msg is Exception) {
-          throw msg;
-        }
-      }
-
-      _setStatus('Loading ONNX model…', progress: 0.50);
-      _estimator = PoseEstimator();
-      await _estimator!.init();
-
-      _setStatus('Estimating pose…', progress: 0.60);
-      final imageBytes = await File(segResult.texturePath).readAsBytes();
-      final image = img.decodeImage(imageBytes)!;
-      final maskBytes = await File(segResult.maskPath).readAsBytes();
-      final maskImage = img.decodeImage(maskBytes);
-      final kpts = await _estimator!.estimate(image, mask: maskImage, straightenLegs: true);
-
-      _setStatus('Building skeleton…', progress: 0.80);
-      final skeleton = kpts != null
-          ? buildSkeleton(kpts)
-          : defaultSkeleton(segResult.h, segResult.w);
-
-      // Extract mask as flat Uint8List (0/255)
-      final maskRaw = Uint8List(segResult.w * segResult.h);
-      if (maskImage != null) {
-        for (int y = 0; y < segResult.h; y++) {
-          for (int x = 0; x < segResult.w; x++) {
-            maskRaw[y * segResult.w + x] = maskImage.getPixel(x, y).r.toInt();
-          }
-        }
-      }
-
-      _setStatus('Done', progress: 1.0);
-      if (mounted) {
-        setState(() {
-          _textureBytes = imageBytes;
-          _texturePath = segResult.texturePath;
-          _maskPath = segResult.maskPath;
-          _imgW = segResult.w;
-          _imgH = segResult.h;
-          _skeleton = List<CharJoint>.from(skeleton);
-          _maskData = maskRaw;
-          _loading = false;
-        });
+      if (kIsWeb) {
+        await _runAnnotationWeb();
+      } else {
+        await _runAnnotationNative();
       }
     } catch (e, st) {
       debugPrint('[Ann] ERROR: $e\n$st');
       if (mounted) setState(() { _status = 'Error: $e'; _loading = false; });
+    }
+  }
+
+  // Web: everything on main thread, no dart:io file I/O
+  Future<void> _runAnnotationWeb() async {
+    _setStatus('Decoding image…', progress: 0.05);
+
+    final rawBytes = widget.imageBytes!;
+    var image = img.decodeImage(rawBytes);
+    if (image == null) throw Exception('Cannot decode image');
+
+    if (image.width > 1000 || image.height > 1000) {
+      final scale = 1000 / math.max(image.width, image.height);
+      image = img.copyResize(image,
+          width: (image.width * scale).round(),
+          height: (image.height * scale).round());
+    }
+
+    final h = image.height;
+    final w = image.width;
+
+    _setStatus('Segmenting…', progress: 0.20);
+    final maskDataRaw = segmentImage(image);
+
+    // Build RGBA texture image
+    final rgba = img.Image(width: w, height: h, numChannels: 4);
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final px = image.getPixel(x, y);
+        rgba.setPixelRgba(x, y, px.r.toInt(), px.g.toInt(), px.b.toInt(), 255);
+      }
+    }
+
+    // Build mask image for pose estimation
+    final maskImgRaw = img.Image(width: w, height: h);
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final v = maskDataRaw[y * w + x];
+        maskImgRaw.setPixelRgba(x, y, v, v, v, 255);
+      }
+    }
+
+    _setStatus('Loading ONNX model…', progress: 0.50);
+    _estimator = PoseEstimator();
+    await _estimator!.init();
+
+    _setStatus('Estimating pose…', progress: 0.60);
+    final kpts = await _estimator!.estimate(rgba, mask: maskImgRaw, straightenLegs: true);
+
+    _setStatus('Building skeleton…', progress: 0.80);
+    final skeleton = kpts != null ? buildSkeleton(kpts) : defaultSkeleton(h, w);
+
+    _setStatus('Done', progress: 1.0);
+    if (mounted) {
+      setState(() {
+        _textureBytes = Uint8List.fromList(img.encodePng(rgba));
+        _imgW = w;
+        _imgH = h;
+        _skeleton = List<CharJoint>.from(skeleton);
+        _maskData = maskDataRaw;
+        _loading = false;
+      });
+    }
+  }
+
+  // Native: use isolate for segmentation, file I/O for temp storage
+  Future<void> _runAnnotationNative() async {
+    final tmpDir = await getTemporaryDirectory();
+    final outDir = '${tmpDir.path}/annotation_out';
+    await Directory(outDir).create(recursive: true);
+
+    _setStatus('Segmenting…', progress: 0.05);
+    final port = ReceivePort();
+    await Isolate.spawn(_segmentIsolate, [widget.imagePath!, outDir, port.sendPort]);
+
+    late final _SegResult segResult;
+    await for (final msg in port) {
+      if (msg is String && msg.startsWith('status:')) {
+        _setStatus(msg.substring(7), progress: msg.contains('Segment') ? 0.20 : 0.05);
+      } else if (msg is _SegResult) {
+        segResult = msg;
+        port.close();
+        break;
+      } else if (msg is Exception) {
+        throw msg;
+      }
+    }
+
+    _setStatus('Loading ONNX model…', progress: 0.50);
+    _estimator = PoseEstimator();
+    await _estimator!.init();
+
+    _setStatus('Estimating pose…', progress: 0.60);
+    final imageBytes = await File(segResult.texturePath).readAsBytes();
+    final image = img.decodeImage(imageBytes)!;
+    final maskBytes = await File(segResult.maskPath).readAsBytes();
+    final maskImage = img.decodeImage(maskBytes);
+    final kpts = await _estimator!.estimate(image, mask: maskImage, straightenLegs: true);
+
+    _setStatus('Building skeleton…', progress: 0.80);
+    final skeleton = kpts != null
+        ? buildSkeleton(kpts)
+        : defaultSkeleton(segResult.h, segResult.w);
+
+    final maskRaw = Uint8List(segResult.w * segResult.h);
+    if (maskImage != null) {
+      for (int y = 0; y < segResult.h; y++) {
+        for (int x = 0; x < segResult.w; x++) {
+          maskRaw[y * segResult.w + x] = maskImage.getPixel(x, y).r.toInt();
+        }
+      }
+    }
+
+    _setStatus('Done', progress: 1.0);
+    if (mounted) {
+      setState(() {
+        _textureBytes = imageBytes;
+        _texturePath = segResult.texturePath;
+        _maskPath = segResult.maskPath;
+        _imgW = segResult.w;
+        _imgH = segResult.h;
+        _skeleton = List<CharJoint>.from(skeleton);
+        _maskData = maskRaw;
+        _loading = false;
+      });
     }
   }
 
@@ -245,11 +324,11 @@ class _AnnotationPageState extends State<AnnotationPage> {
   // ── Navigate to animation ──────────────────────────────────────────────────
 
   Future<void> _onAnimate() async {
-    if (_skeleton.isEmpty || _texturePath == null || _maskPath == null) return;
+    if (_skeleton.isEmpty || _textureBytes == null) return;
 
     final charCfg = CharConfig(height: _imgH, width: _imgW, skeleton: _skeleton);
 
-    // Persist edited mask
+    // Encode edited mask from _maskData to PNG bytes
     final maskImg = img.Image(width: _imgW, height: _imgH);
     for (int y = 0; y < _imgH; y++) {
       for (int x = 0; x < _imgW; x++) {
@@ -257,11 +336,12 @@ class _AnnotationPageState extends State<AnnotationPage> {
         maskImg.setPixelRgba(x, y, v, v, v, 255);
       }
     }
-    await File(_maskPath!).writeAsBytes(img.encodePng(maskImg));
+    final maskBytes = Uint8List.fromList(img.encodePng(maskImg));
 
-    final tmpDir = await getTemporaryDirectory();
-    await File('${tmpDir.path}/annotation_out/char_cfg.yaml')
-        .writeAsString(charCfg.toYamlString());
+    // On native, also persist the edited mask back to the temp file
+    if (!kIsWeb && _maskPath != null) {
+      await File(_maskPath!).writeAsBytes(maskBytes);
+    }
 
     final (_, motionAsset, retargetAsset) = _motions[_selectedMotion];
     final motionYaml = await rootBundle.loadString(motionAsset);
@@ -275,8 +355,8 @@ class _AnnotationPageState extends State<AnnotationPage> {
       MaterialPageRoute(
         builder: (_) => AnimationPage(
           charCfg: charCfg,
-          texturePath: _texturePath!,
-          maskPath: _maskPath!,
+          textureBytes: _textureBytes!,
+          maskBytes: maskBytes,
           motionCfg: motionCfg,
           retargetCfg: retargetCfg,
         ),
@@ -319,7 +399,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 20),
-              _AnnotationStepsList(progress: _progress),
+              _AnnotationStepsList(progress: _progress, isWeb: kIsWeb),
             ],
           ),
         ),
@@ -515,7 +595,6 @@ class _JointPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2;
 
-    // Bones
     for (final j in skeleton) {
       if (j.parent == null) continue;
       final pi = nameToIdx[j.parent];
@@ -524,7 +603,6 @@ class _JointPainter extends CustomPainter {
       canvas.drawLine(_pt(skeleton[pi], t), _pt(j, t), bonePaint);
     }
 
-    // Joints
     for (int i = 0; i < skeleton.length; i++) {
       final j = skeleton[i];
       final pt = _pt(j, t);
@@ -586,10 +664,8 @@ class _MaskPainter extends CustomPainter {
     canvas.save();
     canvas.clipRect(imgRect);
 
-    // Dim everything outside the mask
     canvas.drawRect(imgRect, Paint()..color = Colors.black.withValues(alpha: 0.35));
 
-    // Highlight foreground (red overlay) — row-by-row run-length for perf
     final fgPaint = Paint()
       ..color = Colors.red.withValues(alpha: 0.45)
       ..style = PaintingStyle.fill;
@@ -615,7 +691,6 @@ class _MaskPainter extends CustomPainter {
 
     canvas.restore();
 
-    // Brush cursor ring
     if (brushCenter != null) {
       final bx = brushCenter!.dx * t.scale + t.ox;
       final by = brushCenter!.dy * t.scale + t.oy;
@@ -643,23 +718,33 @@ class _MaskPainter extends CustomPainter {
 
 class _AnnotationStepsList extends StatelessWidget {
   final double progress;
-  const _AnnotationStepsList({required this.progress});
-
-  static const _steps = [
-    (0.05, 'Load image'),
-    (0.20, 'Segment (adaptive threshold + flood fill)'),
-    (0.50, 'Load ONNX model'),
-    (0.60, 'Estimate pose (YOLOv8n)'),
-    (0.80, 'Build skeleton'),
-    (0.90, 'Extract mask data'),
-    (1.00, 'Done'),
-  ];
+  final bool isWeb;
+  const _AnnotationStepsList({required this.progress, required this.isWeb});
 
   @override
   Widget build(BuildContext context) {
+    final steps = isWeb
+        ? const [
+            (0.05, 'Decode image'),
+            (0.20, 'Segment'),
+            (0.50, 'Load ONNX model'),
+            (0.60, 'Estimate pose (YOLOv8n)'),
+            (0.80, 'Build skeleton'),
+            (1.00, 'Done'),
+          ]
+        : const [
+            (0.05, 'Load image'),
+            (0.20, 'Segment (adaptive threshold + flood fill)'),
+            (0.50, 'Load ONNX model'),
+            (0.60, 'Estimate pose (YOLOv8n)'),
+            (0.80, 'Build skeleton'),
+            (0.90, 'Extract mask data'),
+            (1.00, 'Done'),
+          ];
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-      children: _steps.map((s) {
+      children: steps.map((s) {
         final done = progress >= s.$1;
         final active = !done && progress >= (s.$1 - 0.15).clamp(0.0, 1.0);
         return Padding(
@@ -693,7 +778,7 @@ class _AnnotationStepsList extends StatelessWidget {
   }
 }
 
-// ─── Isolate: segmentation only (no plugins) ──────────────────────────────────
+// ─── Isolate: segmentation only (native, no plugins) ──────────────────────────
 
 class _SegResult {
   final String maskPath, texturePath;

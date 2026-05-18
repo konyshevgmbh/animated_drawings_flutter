@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
@@ -10,16 +10,16 @@ import 'gif_export_sheet.dart';
 
 class AnimationPage extends StatefulWidget {
   final CharConfig charCfg;
-  final String texturePath;
-  final String maskPath;
+  final Uint8List textureBytes;
+  final Uint8List maskBytes;
   final MotionConfig motionCfg;
   final RetargetConfig retargetCfg;
 
   const AnimationPage({
     super.key,
     required this.charCfg,
-    required this.texturePath,
-    required this.maskPath,
+    required this.textureBytes,
+    required this.maskBytes,
     required this.motionCfg,
     required this.retargetCfg,
   });
@@ -47,8 +47,8 @@ class _AnimationPageState extends State<AnimationPage> {
   Future<void> _load() async {
     try {
       final state = await buildAnimatedDrawingState(
-        texturePath: widget.texturePath,
-        maskPath: widget.maskPath,
+        textureBytes: widget.textureBytes,
+        maskBytes: widget.maskBytes,
         charCfg: widget.charCfg,
         motionCfg: widget.motionCfg,
         retargetCfg: widget.retargetCfg,
@@ -79,18 +79,13 @@ class _AnimationPageState extends State<AnimationPage> {
       builder: (_) => GifExportSheet(
         widgetSize: widgetSize,
         onExport: ({required speed, required pixelRatio, required outputPath, required backgroundColor, required onProgress}) async {
-          // Compute delay directly from BVH frameTime — no clamping — so the
-          // GIF plays at exactly the same speed as the live animation × speed.
           final bvhFps = 1.0 / s.retargeter.frameTime;
           final effectiveFps = bvhFps * speed;
 
-          // GIF browsers enforce a minimum of 2 cs (20 ms) ≈ 50 fps max.
-          // If the animation is faster than that, skip frames proportionally.
           const maxGifFps = 50.0;
           final step = (effectiveFps / maxGifFps).ceil().clamp(1, s.retargeter.frameCount);
           final captureCount = (s.retargeter.frameCount / step).ceil();
 
-          // Delay in centiseconds: one GIF frame covers `step` native frames.
           final delayCs = (step * 100 / effectiveFps).round().clamp(1, 65535);
 
           final savedValue = ctrl.value;
@@ -178,7 +173,7 @@ class _AnimationPageState extends State<AnimationPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _TexturePreview(path: widget.texturePath),
+              _TexturePreview(bytes: widget.textureBytes),
               const SizedBox(height: 20),
               Text(
                 _progressStep,
@@ -210,8 +205,8 @@ class _AnimationPageState extends State<AnimationPage> {
 // ─── Small preview of the input texture ───────────────────────────────────────
 
 class _TexturePreview extends StatelessWidget {
-  final String path;
-  const _TexturePreview({required this.path});
+  final Uint8List bytes;
+  const _TexturePreview({required this.bytes});
 
   @override
   Widget build(BuildContext context) {
@@ -219,8 +214,8 @@ class _TexturePreview extends StatelessWidget {
       height: 150,
       child: ClipRRect(
         borderRadius: BorderRadius.circular(8),
-        child: Image.file(
-          File(path),
+        child: Image.memory(
+          bytes,
           fit: BoxFit.contain,
           errorBuilder: (_, __, ___) => const Center(
             child: Icon(Icons.image_not_supported, size: 48, color: Colors.grey),
