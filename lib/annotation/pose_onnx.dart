@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset;
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
 
@@ -21,7 +21,16 @@ class PoseEstimator {
   OrtSession? _session;
 
   Future<void> init() async {
-    _session = await OnnxRuntime().createSessionFromAsset(_modelAsset);
+    // On web, Flutter stores assets at assets/assets/..., but createSessionFromAsset
+    // passes the key verbatim to ONNX Runtime JS which fetches assets/... (single prefix) → 404.
+    // Pass the web-correct path directly; on other platforms use the standard method.
+    if (kIsWeb) {
+      _session = await OnnxRuntime().createSession(
+        'assets/$_modelAsset',
+      );
+    } else {
+      _session = await OnnxRuntime().createSessionFromAsset(_modelAsset);
+    }
   }
 
   void dispose() {
