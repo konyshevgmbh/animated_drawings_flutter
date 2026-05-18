@@ -297,78 +297,6 @@ class _AnnotationPageState extends State<AnnotationPage> {
     );
   }
 
-  // Native only: load pre-annotated folder → go directly to AnimationPage
-  Future<void> _loadAnnotationFolder() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['yaml', 'yml'],
-      dialogTitle: 'Select char_cfg.yaml from annotation folder',
-      withData: false,
-    );
-    if (result == null || result.files.isEmpty) return;
-    final cfgPath = result.files.first.path;
-    if (cfgPath == null) return;
-
-    final folder = File(cfgPath).parent.path;
-    final sep = Platform.pathSeparator;
-    final texturePath = '$folder${sep}texture.png';
-    final maskPath = '$folder${sep}mask.png';
-
-    if (!File(texturePath).existsSync() || !File(maskPath).existsSync()) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('texture.png or mask.png not found in folder')),
-      );
-      return;
-    }
-
-    final charCfgYaml = await File(cfgPath).readAsString();
-    CharConfig charCfg;
-    try {
-      charCfg = CharConfig.fromYamlString(charCfgYaml);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to parse char_cfg.yaml: $e')),
-      );
-      return;
-    }
-
-    if (!mounted) return;
-    final motionIdx = await _pickMotionDialog(context);
-    if (motionIdx == null) return;
-
-    final (_, motionAsset, retargetAsset) = _motions[motionIdx];
-    final motionYaml = await rootBundle.loadString(motionAsset);
-    final retargetYaml = await rootBundle.loadString(retargetAsset);
-    final motionCfg = MotionConfig.fromYamlString(motionYaml, 'assets');
-    final retargetCfg = RetargetConfig.fromYamlString(retargetYaml);
-
-    final textureBytes = await File(texturePath).readAsBytes();
-    final maskBytes = await File(maskPath).readAsBytes();
-
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => AnimationPage(
-          charCfg: charCfg,
-          textureBytes: textureBytes,
-          maskBytes: maskBytes,
-          motionCfg: motionCfg,
-          retargetCfg: retargetCfg,
-        ),
-      ),
-    );
-  }
-
-  void _onMenuSelected(String value) {
-    switch (value) {
-      case 'open': _pickAndReloadImage();
-      case 'folder': _loadAnnotationFolder();
-    }
-  }
-
   // ── Gesture handlers ───────────────────────────────────────────────────────
 
   void _onPanStart(DragStartDetails d) {
@@ -510,27 +438,10 @@ class _AnnotationPageState extends State<AnnotationPage> {
       appBar: AppBar(
         title: const Text('Animated Drawings'),
         actions: [
-          PopupMenuButton<String>(
-            onSelected: _onMenuSelected,
-            itemBuilder: (_) => [
-              const PopupMenuItem(
-                value: 'open',
-                child: ListTile(
-                  leading: Icon(Icons.image),
-                  title: Text('Open image…'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              if (!kIsWeb)
-                const PopupMenuItem(
-                  value: 'folder',
-                  child: ListTile(
-                    leading: Icon(Icons.folder_open),
-                    title: Text('Load annotation folder'),
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                ),
-            ],
+          IconButton(
+            icon: const Icon(Icons.add_photo_alternate),
+            tooltip: 'Open image…',
+            onPressed: _pickAndReloadImage,
           ),
         ],
       ),
@@ -1061,31 +972,3 @@ Future<void> _segmentIsolate(List<dynamic> args) async {
   }
 }
 
-// ─── Motion picker dialog (used by Load annotation folder) ───────────────────
-
-Future<int?> _pickMotionDialog(BuildContext context) {
-  int selected = 0;
-  return showDialog<int>(
-    context: context,
-    builder: (ctx) => StatefulBuilder(
-      builder: (ctx, setState) => AlertDialog(
-        title: const Text('Select motion'),
-        content: RadioGroup<int>(
-          groupValue: selected,
-          onChanged: (v) => setState(() => selected = v!),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: List.generate(_motions.length, (i) => RadioListTile<int>(
-              title: Text(_motions[i].$1),
-              value: i,
-            )),
-          ),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(ctx, selected), child: const Text('OK')),
-        ],
-      ),
-    ),
-  );
-}
