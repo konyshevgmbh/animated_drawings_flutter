@@ -14,6 +14,7 @@ const RESOURCES = {"assets/shaders/ink_sparkle.frag": "ecc85a2e95f5e9f53123dcaf8
 "assets/assets/config/retarget/mixamo_fff.yaml": "fb08c0cce9c4adc550d9303a7b0d8544",
 "assets/assets/config/retarget/fair1_ppf_duo1.yaml": "5b832cd71d16cc4a7760cce06e0a3a00",
 "assets/assets/config/retarget/four_legs.yaml": "c9ac17eeb1c869881986be471d5cccf3",
+"assets/assets/config/retarget/cmu_una_pfp.yaml": "10862eea8a2f357d3395c6585ee50d5c",
 "assets/assets/config/retarget/cmu1_pfp.yaml": "9f70ce1e3ac6c59b9dfec451ee09de39",
 "assets/assets/config/retarget/six_arms.yaml": "9003a37f58b5a0b8b3ae05ad29d34240",
 "assets/assets/config/retarget/fair1_spf.yaml": "c3f3a7e622a78fd59254ae9cf811b358",
@@ -26,12 +27,12 @@ const RESOURCES = {"assets/shaders/ink_sparkle.frag": "ecc85a2e95f5e9f53123dcaf8
 "assets/assets/bvh/rokoko/jesse_dance.bvh": "94ef6278b7493f35243ca5fb39a7ef36",
 "assets/assets/models/drawn_humanoid_pose.onnx": "57d2d8aa1bd694881d98a161c52f28e2",
 "assets/fonts/MaterialIcons-Regular.otf": "d479e5558e05b62e47a7283cbcf8c755",
-"assets/AssetManifest.bin": "799adea7ee2b38a398f7d444eb9728bc",
+"assets/AssetManifest.bin": "c16b2440ab01cb4c605f88b0b42ac1f6",
 "assets/FontManifest.json": "dc3d03800ccca4601324923c0b1d6d57",
-"assets/AssetManifest.bin.json": "767819e637e26e277382fbd69704d897",
+"assets/AssetManifest.bin.json": "d1be55d53a0bcd29a80c246a799cb125",
 "assets/NOTICES": "f91831a3cd64b8dd27bfd7ccf3a49792",
 "assets/packages/cupertino_icons/assets/CupertinoIcons.ttf": "33b7d9392238c04c131b6ce224e13711",
-"assets/AssetManifest.json": "1902a39a8a30c21c92e2c82b5c7eab66",
+"assets/AssetManifest.json": "52caf6e7a0c224b0f6644f33d84627a7",
 "favicon.png": "5dcef449791fa27946b3d35ad8803796",
 "version.json": "16ae95ab5cc2b91e8454515fce49d556",
 "index.html": "66da82ccfdfb66752fe8422223a9c925",
@@ -53,9 +54,9 @@ const RESOURCES = {"assets/shaders/ink_sparkle.frag": "ecc85a2e95f5e9f53123dcaf8
 "canvaskit/canvaskit.js": "140ccb7d34d0a55065fbd422b843add6",
 "canvaskit/skwasm.wasm": "264db41426307cfc7fa44b95a7772109",
 "canvaskit/skwasm_heavy.js.symbols": "3c01ec03b5de6d62c34e17014d1decd3",
-"flutter_bootstrap.js": "7b7a6f06bb4ec9fc3c1c2ef15c2bfa0a",
+"flutter_bootstrap.js": "571aa65832e595c4c644ce311d2a107f",
 "manifest.json": "8a06714a1a2a0d0e21f971e8acb411d6",
-"main.dart.js": "2006f262dde98507a9012a37ec599e2c"};
+"main.dart.js": "6d07a279d63f2bfc1f7d1d0a0391a2dc"};
 // The application shell files that are downloaded before a service worker can
 // start.
 const CORE = ["main.dart.js",
