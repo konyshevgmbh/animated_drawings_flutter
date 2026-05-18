@@ -606,51 +606,54 @@ class _AnnotationPageState extends State<AnnotationPage> {
 
   Widget _buildMotionPanel() {
     final isCustom = _selectedMotion == _motions.length;
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const Text('Select motion:'),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 4,
-            children: [
-              ...List.generate(_motions.length, (i) => ChoiceChip(
-                label: Text(_motions[i].$1),
-                selected: _selectedMotion == i,
-                onSelected: (_) => setState(() => _selectedMotion = i),
-              )),
-              ChoiceChip(
-                label: Text(
-                  isCustom && _customBvhContent != null
-                      ? _customBvhFileName
-                      : 'Custom BVH…',
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('Select motion:'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                ...List.generate(_motions.length, (i) => ChoiceChip(
+                  label: Text(_motions[i].$1),
+                  selected: _selectedMotion == i,
+                  onSelected: (_) => setState(() => _selectedMotion = i),
+                )),
+                ChoiceChip(
+                  label: Text(
+                    isCustom && _customBvhContent != null
+                        ? _customBvhFileName
+                        : 'Custom BVH…',
+                  ),
+                  selected: isCustom,
+                  onSelected: (_) {
+                    setState(() => _selectedMotion = _motions.length);
+                    _pickCustomBvh();
+                  },
                 ),
-                selected: isCustom,
-                onSelected: (_) {
-                  setState(() => _selectedMotion = _motions.length);
-                  _pickCustomBvh();
-                },
+              ],
+            ),
+            if (isCustom && _customBvhContent != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Detected: ${_formatLabel(_customBvhFormat)}',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
               ),
             ],
-          ),
-          if (isCustom && _customBvhContent != null) ...[
-            const SizedBox(height: 6),
-            Text(
-              'Detected: ${_formatLabel(_customBvhFormat)}',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Animate'),
+              onPressed: (!isCustom || _customBvhContent != null) ? _onAnimate : null,
             ),
           ],
-          const SizedBox(height: 16),
-          ElevatedButton.icon(
-            icon: const Icon(Icons.play_arrow),
-            label: const Text('Animate'),
-            onPressed: (!isCustom || _customBvhContent != null) ? _onAnimate : null,
-          ),
-        ],
+        ),
       ),
     );
   }
