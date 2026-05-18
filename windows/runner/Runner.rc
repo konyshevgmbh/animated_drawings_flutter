@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.konyshevgmbh" "\0"
-            VALUE "FileDescription", "flutter_animated_drawings" "\0"
+            VALUE "FileDescription", "Animaka" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "flutter_animated_drawings" "\0"
+            VALUE "InternalName", "Animaka" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.konyshevgmbh. All rights reserved." "\0"
-            VALUE "OriginalFilename", "flutter_animated_drawings.exe" "\0"
-            VALUE "ProductName", "flutter_animated_drawings" "\0"
+            VALUE "OriginalFilename", "Animaka.exe" "\0"
+            VALUE "ProductName", "Animaka" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

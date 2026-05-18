@@ -436,7 +436,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Animated Drawings'),
+        title: const Text('Animaka'),
         actions: [
           IconButton(
             icon: const Icon(Icons.add_photo_alternate),
