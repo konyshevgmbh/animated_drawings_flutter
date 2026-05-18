@@ -462,10 +462,10 @@ class _BgColorPicker extends StatelessWidget {
   const _BgColorPicker({required this.selected, required this.onChanged});
 
   static const _swatches = <(String, Color?)>[
-    ('Transparent', null),
-    ('White', Color(0xFFFFFFFF)),
+    ('White', null),
     ('Black', Color(0xFF000000)),
     ('Green', Color(0xFF00B140)),
+    ('Light grey', Color(0xFFC6C6C8)),
   ];
 
   @override

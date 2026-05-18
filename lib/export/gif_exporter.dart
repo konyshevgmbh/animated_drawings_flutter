@@ -88,17 +88,21 @@ Uint8List? _encodeGif(_EncodeParams p) {
       numChannels: 4,
       order: img.ChannelOrder.rgba,
     );
-    if (p.bgArgb != null) {
-      final a = (p.bgArgb! >> 24) & 0xFF;
-      final r = (p.bgArgb! >> 16) & 0xFF;
-      final g = (p.bgArgb! >> 8) & 0xFF;
-      final b = p.bgArgb! & 0xFF;
-      final bg = img.fill(
-        img.Image(width: f.width, height: f.height),
-        color: img.ColorRgba8(r, g, b, a),
-      );
-      frame = img.compositeImage(bg, frame);
-    }
+    // GIF has no real alpha — composite every frame onto a solid background.
+    // Null → white (avoids black fill from palette quantisation of alpha=0 pixels).
+    final bgColor = p.bgArgb != null
+        ? img.ColorRgba8(
+            (p.bgArgb! >> 16) & 0xFF,
+            (p.bgArgb! >> 8) & 0xFF,
+            p.bgArgb! & 0xFF,
+            (p.bgArgb! >> 24) & 0xFF,
+          )
+        : img.ColorRgba8(255, 255, 255, 255);
+    final bg = img.fill(
+      img.Image(width: f.width, height: f.height),
+      color: bgColor,
+    );
+    frame = img.compositeImage(bg, frame);
     encoder.addFrame(frame, duration: delay);
   }
   return encoder.finish();
