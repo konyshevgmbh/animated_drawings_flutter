@@ -16,11 +16,11 @@ import 'animation_page.dart';
 
 const _motions = [
   ('dab', 'assets/config/motion/dab.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
-  ('wave_hello', 'assets/config/motion/wave_hello.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
+  ('hello', 'assets/config/motion/wave_hello.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
   ('jumping', 'assets/config/motion/jumping.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
   ('zombie', 'assets/config/motion/zombie.yaml', 'assets/config/retarget/fair1_ppf.yaml'),
-  ('jesse_dance', 'assets/config/motion/jesse_dance.yaml', 'assets/config/retarget/mixamo_fff.yaml'),
-  ('jumping_jacks', 'assets/config/motion/jumping_jacks.yaml', 'assets/config/retarget/cmu1_pfp.yaml'),
+  ('dance', 'assets/config/motion/jesse_dance.yaml', 'assets/config/retarget/mixamo_fff.yaml'),
+  ('fit', 'assets/config/motion/jumping_jacks.yaml', 'assets/config/retarget/cmu1_pfp.yaml'),
 ];
 
 enum _EditMode { joints, mask }
@@ -612,13 +612,14 @@ class _AnnotationPageState extends State<AnnotationPage> {
         padding: const EdgeInsets.all(12),
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             const Text('Select motion:'),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
               runSpacing: 4,
+              alignment: WrapAlignment.center,
               children: [
                 ...List.generate(_motions.length, (i) => ChoiceChip(
                   label: Text(_motions[i].$1),
