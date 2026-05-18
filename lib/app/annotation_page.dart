@@ -75,6 +75,8 @@ class _AnnotationPageState extends State<AnnotationPage> {
   String _customBvhFileName = '';
   String _customBvhFormat = 'fair1';
 
+  Color _bgColor = Colors.white;
+
   PoseEstimator? _estimator;
 
   @override
@@ -177,6 +179,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
     _setStatus('Building skeleton…', progress: 0.80);
     final skeleton = kpts != null ? buildSkeleton(kpts) : defaultSkeleton(h, w);
 
+    final bgColor = _computeAvgBgColor(rgba, maskDataRaw);
     _setStatus('Done', progress: 1.0);
     if (mounted) {
       setState(() {
@@ -185,6 +188,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
         _imgH = h;
         _skeleton = List<CharJoint>.from(skeleton);
         _maskData = maskDataRaw;
+        _bgColor = bgColor;
         _loading = false;
       });
     }
@@ -238,6 +242,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
       }
     }
 
+    final bgColor = _computeAvgBgColor(image, maskRaw);
     _setStatus('Done', progress: 1.0);
     if (mounted) {
       setState(() {
@@ -247,6 +252,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
         _imgH = segResult.h;
         _skeleton = List<CharJoint>.from(skeleton);
         _maskData = maskRaw;
+        _bgColor = bgColor;
         _loading = false;
       });
     }
@@ -277,6 +283,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
       _editMode = _EditMode.joints;
       _selectedMotion = 0;
       _customBvhContent = null;
+      _bgColor = Colors.white;
     });
     await _runAnnotation();
   }
@@ -425,6 +432,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
           maskBytes: maskBytes,
           motionCfg: motionCfg,
           retargetCfg: retargetCfg,
+          bgColor: _bgColor,
         ),
       ),
     );
@@ -676,6 +684,24 @@ class _AnnotationPageState extends State<AnnotationPage> {
       _customBvhFileName = file.name;
       _customBvhFormat = format;
     });
+  }
+
+  static Color _computeAvgBgColor(img.Image rgba, Uint8List maskData) {
+    int r = 0, g = 0, b = 0, count = 0;
+    final w = rgba.width;
+    final h = rgba.height;
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        if (maskData[y * w + x] != 0) continue;
+        final px = rgba.getPixel(x, y);
+        r += px.r.toInt();
+        g += px.g.toInt();
+        b += px.b.toInt();
+        count++;
+      }
+    }
+    if (count == 0) return Colors.white;
+    return Color.fromARGB(255, r ~/ count, g ~/ count, b ~/ count);
   }
 
   static String _formatLabel(String format) => switch (format) {

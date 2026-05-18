@@ -6,6 +6,7 @@ import '../annotation/char_cfg.dart';
 import '../export/gif_exporter.dart';
 import '../rendering/animated_drawing_widget.dart';
 import '../retarget/config_models.dart';
+import 'bg_color_picker.dart';
 import 'gif_export_sheet.dart';
 
 class AnimationPage extends StatefulWidget {
@@ -14,6 +15,7 @@ class AnimationPage extends StatefulWidget {
   final Uint8List maskBytes;
   final MotionConfig motionCfg;
   final RetargetConfig retargetCfg;
+  final Color bgColor;
 
   const AnimationPage({
     super.key,
@@ -22,6 +24,7 @@ class AnimationPage extends StatefulWidget {
     required this.maskBytes,
     required this.motionCfg,
     required this.retargetCfg,
+    this.bgColor = Colors.white,
   });
 
   @override
@@ -38,10 +41,43 @@ class _AnimationPageState extends State<AnimationPage> {
   AnimationController? _animCtrl;
   final _repaintKey = GlobalKey();
 
+  late Color _bgColor;
+
   @override
   void initState() {
     super.initState();
+    _bgColor = widget.bgColor;
     _load();
+  }
+
+  void _showBgColorPicker() {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Background', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 16),
+              StatefulBuilder(
+                builder: (ctx, setLocal) => BgColorPicker(
+                  selected: _bgColor,
+                  sceneBgColor: widget.bgColor,
+                  onChanged: (c) {
+                    setLocal(() {});
+                    setState(() => _bgColor = c ?? widget.bgColor);
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _load() async {
@@ -78,6 +114,8 @@ class _AnimationPageState extends State<AnimationPage> {
       ),
       builder: (_) => GifExportSheet(
         widgetSize: widgetSize,
+        initialBgColor: _bgColor,
+        sceneBgColor: widget.bgColor,
         onExport: ({required speed, required pixelRatio, required outputPath, required backgroundColor, required onProgress}) async {
           final bvhFps = 1.0 / s.retargeter.frameTime;
           final effectiveFps = bvhFps * speed;
@@ -121,12 +159,18 @@ class _AnimationPageState extends State<AnimationPage> {
       appBar: AppBar(
         title: const Text('Animation'),
         actions: [
-          if (_drawingState != null)
+          if (_drawingState != null) ...[
+            IconButton(
+              icon: const Icon(Icons.palette_outlined),
+              tooltip: 'Background color',
+              onPressed: _showBgColorPicker,
+            ),
             IconButton(
               icon: const Icon(Icons.gif_box_outlined),
               tooltip: 'Export GIF',
               onPressed: _showExportSheet,
             ),
+          ],
         ],
       ),
       body: _buildBody(),
@@ -152,12 +196,15 @@ class _AnimationPageState extends State<AnimationPage> {
     if (_drawingState == null) {
       return _buildLoadingUI();
     }
-    return Center(
-      child: RepaintBoundary(
-        key: _repaintKey,
-        child: AnimatedDrawingWidget(
-          state: _drawingState!,
-          onReady: (ctrl) => _animCtrl = ctrl,
+    return ColoredBox(
+      color: _bgColor,
+      child: Center(
+        child: RepaintBoundary(
+          key: _repaintKey,
+          child: AnimatedDrawingWidget(
+            state: _drawingState!,
+            onReady: (ctrl) => _animCtrl = ctrl,
+          ),
         ),
       ),
     );
