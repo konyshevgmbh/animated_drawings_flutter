@@ -1,16 +1,15 @@
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
-import 'package:path_provider/path_provider.dart';
 
 import '../annotation/char_cfg.dart';
 import '../annotation/pose_onnx.dart';
 import '../annotation/segmentation.dart';
+import '../annotation/straighten_legs.dart' as legs;
 import '../retarget/config_models.dart';
 import 'animation_page.dart';
 
@@ -133,7 +132,7 @@ class _AnnotationPageState extends State<AnnotationPage> {
     return data.buffer.asUint8List();
   }
 
-  // In-memory path: works for web, asset loading, and picked-file bytes
+  // Works for web, asset loading, and picked-file bytes (also used by native path).
   Future<void> _runAnnotationWithBytes(Uint8List rawBytes) async {
     _setStatus('Decoding image…', progress: 0.05);
 
@@ -147,37 +146,69 @@ class _AnnotationPageState extends State<AnnotationPage> {
           height: (image.height * scale).round());
     }
 
-    final h = image.height;
-    final w = image.width;
+    _setStatus('Loading ONNX model…', progress: 0.20);
+    _estimator = PoseEstimator();
+    await _estimator!.init();
 
-    _setStatus('Segmenting…', progress: 0.20);
-    final maskDataRaw = segmentImage(image);
+    _setStatus('Detecting character…', progress: 0.35);
+    final detection = await _estimator!.detectBboxAndKpts(image);
+
+    // Crop to YOLO bounding box (+ 5% margin on each side) when found.
+    img.Image workImage = image;
+    double cropOx = 0, cropOy = 0;
+    if (detection.bbox != null) {
+      final box = detection.bbox!;
+      final mx = box.width * 0.05;
+      final my = box.height * 0.05;
+      final x = (box.left - mx).clamp(0.0, image.width.toDouble()).toInt();
+      final y = (box.top - my).clamp(0.0, image.height.toDouble()).toInt();
+      final cw = ((box.right + mx).clamp(0.0, image.width.toDouble()) - x)
+          .toInt()
+          .clamp(1, image.width - x);
+      final ch = ((box.bottom + my).clamp(0.0, image.height.toDouble()) - y)
+          .toInt()
+          .clamp(1, image.height - y);
+      workImage = img.copyCrop(image, x: x, y: y, width: cw, height: ch);
+      cropOx = x.toDouble();
+      cropOy = y.toDouble();
+      debugPrint('[Ann] cropped to bbox: ($x,$y) ${cw}x$ch');
+    }
+
+    final h = workImage.height;
+    final w = workImage.width;
+
+    _setStatus('Segmenting…', progress: 0.55);
+    final maskDataRaw = segmentImage(workImage);
 
     final rgba = img.Image(width: w, height: h, numChannels: 4);
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
-        final px = image.getPixel(x, y);
+        final px = workImage.getPixel(x, y);
         rgba.setPixelRgba(x, y, px.r.toInt(), px.g.toInt(), px.b.toInt(), 255);
       }
     }
 
-    final maskImgRaw = img.Image(width: w, height: h);
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final v = maskDataRaw[y * w + x];
-        maskImgRaw.setPixelRgba(x, y, v, v, v, 255);
+    _setStatus('Building skeleton…', progress: 0.75);
+    final List<CharJoint> skeleton;
+    if (detection.kpts != null) {
+      // Adjust keypoints from original-image coords to cropped-image coords.
+      final adjusted = detection.kpts!
+          .map((p) => Offset(p.dx - cropOx, p.dy - cropOy))
+          .toList();
+      skeleton = buildSkeleton(legs.straightenLegs(adjusted));
+    } else {
+      // Mask-based fallback: try YOLO on the silhouette image.
+      final maskImg = img.Image(width: w, height: h);
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          final v = maskDataRaw[y * w + x];
+          maskImg.setPixelRgba(x, y, v, v, v, 255);
+        }
       }
+      final kpts =
+          await _estimator!.estimateMaskOnly(maskImg, straightenLegs: true);
+      skeleton = kpts != null ? buildSkeleton(kpts) : defaultSkeleton(h, w);
     }
-
-    _setStatus('Loading ONNX model…', progress: 0.50);
-    _estimator = PoseEstimator();
-    await _estimator!.init();
-
-    _setStatus('Estimating pose…', progress: 0.60);
-    final kpts = await _estimator!.estimate(rgba, mask: maskImgRaw, straightenLegs: true);
-
-    _setStatus('Building skeleton…', progress: 0.80);
-    final skeleton = kpts != null ? buildSkeleton(kpts) : defaultSkeleton(h, w);
 
     final bgColor = _computeAvgBgColor(rgba, maskDataRaw);
     _setStatus('Done', progress: 1.0);
@@ -194,68 +225,11 @@ class _AnnotationPageState extends State<AnnotationPage> {
     }
   }
 
-  // Isolate path: uses file path for background segmentation (native only)
+  // Native path: read file bytes, then share the same pipeline as web/bytes.
   Future<void> _runAnnotationNative() async {
-    final tmpDir = await getTemporaryDirectory();
-    final outDir = '${tmpDir.path}/annotation_out';
-    await Directory(outDir).create(recursive: true);
-
-    _setStatus('Segmenting…', progress: 0.05);
-    final port = ReceivePort();
-    await Isolate.spawn(_segmentIsolate, [_currentImagePath!, outDir, port.sendPort]);
-
-    late final _SegResult segResult;
-    await for (final msg in port) {
-      if (msg is String && msg.startsWith('status:')) {
-        _setStatus(msg.substring(7), progress: msg.contains('Segment') ? 0.20 : 0.05);
-      } else if (msg is _SegResult) {
-        segResult = msg;
-        port.close();
-        break;
-      } else if (msg is Exception) {
-        throw msg;
-      }
-    }
-
-    _setStatus('Loading ONNX model…', progress: 0.50);
-    _estimator = PoseEstimator();
-    await _estimator!.init();
-
-    _setStatus('Estimating pose…', progress: 0.60);
-    final imageBytes = await File(segResult.texturePath).readAsBytes();
-    final image = img.decodeImage(imageBytes)!;
-    final maskBytes = await File(segResult.maskPath).readAsBytes();
-    final maskImage = img.decodeImage(maskBytes);
-    final kpts = await _estimator!.estimate(image, mask: maskImage, straightenLegs: true);
-
-    _setStatus('Building skeleton…', progress: 0.80);
-    final skeleton = kpts != null
-        ? buildSkeleton(kpts)
-        : defaultSkeleton(segResult.h, segResult.w);
-
-    final maskRaw = Uint8List(segResult.w * segResult.h);
-    if (maskImage != null) {
-      for (int y = 0; y < segResult.h; y++) {
-        for (int x = 0; x < segResult.w; x++) {
-          maskRaw[y * segResult.w + x] = maskImage.getPixel(x, y).r.toInt();
-        }
-      }
-    }
-
-    final bgColor = _computeAvgBgColor(image, maskRaw);
-    _setStatus('Done', progress: 1.0);
-    if (mounted) {
-      setState(() {
-        _textureBytes = imageBytes;
-        _maskPath = segResult.maskPath;
-        _imgW = segResult.w;
-        _imgH = segResult.h;
-        _skeleton = List<CharJoint>.from(skeleton);
-        _maskData = maskRaw;
-        _bgColor = bgColor;
-        _loading = false;
-      });
-    }
+    _setStatus('Loading image…', progress: 0.02);
+    final bytes = await File(_currentImagePath!).readAsBytes();
+    await _runAnnotationWithBytes(bytes);
   }
 
   void _setStatus(String s, {double progress = -1}) {
@@ -945,60 +919,4 @@ class _AnnotationStepsList extends StatelessWidget {
   }
 }
 
-// ─── Isolate: segmentation only (native, no plugins) ──────────────────────────
-
-class _SegResult {
-  final String maskPath, texturePath;
-  final int w, h;
-  _SegResult(this.maskPath, this.texturePath, this.w, this.h);
-}
-
-Future<void> _segmentIsolate(List<dynamic> args) async {
-  final imagePath = args[0] as String;
-  final outDir = args[1] as String;
-  final sendPort = args[2] as SendPort;
-
-  try {
-    sendPort.send('status:Loading image…');
-    final bytes = await File(imagePath).readAsBytes();
-    var image = img.decodeImage(bytes);
-    if (image == null) throw Exception('Cannot decode image');
-
-    if (image.width > 1000 || image.height > 1000) {
-      final scale = 1000 / math.max(image.width, image.height);
-      image = img.copyResize(image,
-          width: (image.width * scale).round(),
-          height: (image.height * scale).round());
-    }
-
-    final h = image.height;
-    final w = image.width;
-
-    sendPort.send('status:Segmenting…');
-    final maskData = segmentImage(image);
-    final maskImg = img.Image(width: w, height: h);
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final v = maskData[y * w + x];
-        maskImg.setPixelRgba(x, y, v, v, v, 255);
-      }
-    }
-    final maskPath = '$outDir/mask.png';
-    await File(maskPath).writeAsBytes(img.encodePng(maskImg));
-
-    final rgba = img.Image(width: w, height: h, numChannels: 4);
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final px = image.getPixel(x, y);
-        rgba.setPixelRgba(x, y, px.r.toInt(), px.g.toInt(), px.b.toInt(), 255);
-      }
-    }
-    final texturePath = '$outDir/texture.png';
-    await File(texturePath).writeAsBytes(img.encodePng(rgba));
-
-    sendPort.send(_SegResult(maskPath, texturePath, w, h));
-  } catch (e) {
-    sendPort.send(Exception(e.toString()));
-  }
-}
 

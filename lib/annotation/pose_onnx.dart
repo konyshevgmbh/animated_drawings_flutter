@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Offset;
+import 'dart:ui' show Offset, Rect;
 import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
@@ -37,6 +37,19 @@ class PoseEstimator {
     _session?.close();
   }
 
+  /// Runs one YOLO inference pass and returns the best detection's bounding box
+  /// and keypoints in original image coordinates. Both fields are null when no
+  /// detection passes the confidence threshold.
+  Future<({Rect? bbox, List<Offset>? kpts})> detectBboxAndKpts(
+      img.Image image) async {
+    assert(_session != null, 'Call init() first');
+    final origW = image.width;
+    final origH = image.height;
+    final inf = await _runInference(image);
+    if (inf == null) return (bbox: null, kpts: null);
+    return _decodeBboxAndKpts(inf.flat, origW, origH, inf.scale, inf.padX, inf.padY);
+  }
+
   /// Returns COCO-17 keypoints in original image coords, or null if no pose found.
   Future<List<Offset>?> estimate(img.Image image,
       {img.Image? mask, bool straightenLegs = false}) async {
@@ -46,14 +59,7 @@ class PoseEstimator {
 
     if (result == null && mask != null) {
       debugPrint('[Pose] no pose on original — retrying on mask silhouette...');
-      final maskRgb = img.Image(width: mask.width, height: mask.height);
-      for (int y = 0; y < mask.height; y++) {
-        for (int x = 0; x < mask.width; x++) {
-          final v = mask.getPixel(x, y).r.toInt();
-          maskRgb.setPixelRgba(x, y, v, v, v, 255);
-        }
-      }
-      result = await _inferOnImage(maskRgb, 'mask');
+      result = await estimateMaskOnly(mask, straightenLegs: false);
     }
 
     if (result != null && straightenLegs) {
@@ -62,17 +68,33 @@ class PoseEstimator {
     return result;
   }
 
-  Future<List<Offset>?> _inferOnImage(img.Image image, String label) async {
+  /// Runs YOLO only on the mask silhouette image (grayscale rendered as RGB).
+  Future<List<Offset>?> estimateMaskOnly(img.Image maskImg,
+      {bool straightenLegs = false}) async {
+    assert(_session != null, 'Call init() first');
+    final maskRgb = img.Image(width: maskImg.width, height: maskImg.height);
+    for (int y = 0; y < maskImg.height; y++) {
+      for (int x = 0; x < maskImg.width; x++) {
+        final v = maskImg.getPixel(x, y).r.toInt();
+        maskRgb.setPixelRgba(x, y, v, v, v, 255);
+      }
+    }
+    var result = await _inferOnImage(maskRgb, 'mask');
+    if (result != null && straightenLegs) result = legs.straightenLegs(result);
+    return result;
+  }
+
+  // ── Shared inference runner ────────────────────────────────────────────────
+
+  Future<({Float32List flat, double scale, int padX, int padY})?> _runInference(
+      img.Image image) async {
     final origW = image.width;
     final origH = image.height;
-
-    // Letterbox resize to 640×640
     final scale = _inputSize / math.max(origW, origH);
     final rW = (origW * scale).round();
     final rH = (origH * scale).round();
     final resized = img.copyResize(image, width: rW, height: rH);
 
-    // Build float tensor [1,3,640,640] RGB normalized [0,1]
     const gray = 114.0 / 255.0;
     final tensor = Float32List(_inputSize * _inputSize * 3)
       ..fillRange(0, _inputSize * _inputSize * 3, gray);
@@ -81,22 +103,14 @@ class PoseEstimator {
     for (int y = 0; y < rH; y++) {
       for (int x = 0; x < rW; x++) {
         final px = resized.getPixel(x, y);
-        final destX = x + padX;
-        final destY = y + padY;
-        final offset = destY * _inputSize + destX;
-        tensor[offset] = px.r / 255.0;
-        tensor[_inputSize * _inputSize + offset] = px.g / 255.0;
-        tensor[2 * _inputSize * _inputSize + offset] = px.b / 255.0;
+        final off = (y + padY) * _inputSize + (x + padX);
+        tensor[off] = px.r / 255.0;
+        tensor[_inputSize * _inputSize + off] = px.g / 255.0;
+        tensor[2 * _inputSize * _inputSize + off] = px.b / 255.0;
       }
     }
 
-    debugPrint('[Pose] $label: ${origW}x$origH → scale=$scale rW=$rW rH=$rH padX=$padX padY=$padY');
-
-    final inputValue = await OrtValue.fromList(
-      tensor,
-      [1, 3, _inputSize, _inputSize],
-    );
-
+    final inputValue = await OrtValue.fromList(tensor, [1, 3, _inputSize, _inputSize]);
     Map<String, OrtValue?> outputs;
     try {
       outputs = await _session!.run({'images': inputValue});
@@ -104,7 +118,7 @@ class PoseEstimator {
       await inputValue.dispose();
     }
 
-    // Output shape: [1, 56, 8400] — flattened to 1*56*8400
+    // Output shape: [1, 56, 8400]
     final outputKey = outputs.keys.firstOrNull;
     Float32List? flat;
     if (outputKey != null) {
@@ -115,13 +129,81 @@ class PoseEstimator {
     for (final v in outputs.values) { await v?.dispose(); }
 
     if (flat == null) return null;
+    return (flat: flat, scale: scale, padX: padX, padY: padY);
+  }
 
+  Future<List<Offset>?> _inferOnImage(img.Image image, String label) async {
+    final origW = image.width;
+    final origH = image.height;
+    final inf = await _runInference(image);
+    if (inf == null) return null;
+    debugPrint('[Pose] $label: ${origW}x$origH → scale=${inf.scale} padX=${inf.padX} padY=${inf.padY}');
     List<Offset>? result;
     for (final conf in [0.25, 0.10, 0.05, 0.01]) {
-      result = _decodeOutput(flat, conf, origW, origH, scale, padX, padY, label);
+      result = _decodeOutput(inf.flat, conf, origW, origH, inf.scale, inf.padX, inf.padY, label);
       if (result != null) break;
     }
     return result;
+  }
+
+  ({Rect? bbox, List<Offset>? kpts}) _decodeBboxAndKpts(
+      Float32List flat, int origW, int origH, double scale, int padX, int padY) {
+    const numDetections = 8400;
+    final contentW = (origW * scale).round();
+    final contentH = (origH * scale).round();
+
+    double bestConf = 0.01;
+    int bestIdx = -1;
+    for (int i = 0; i < numDetections; i++) {
+      final cx = flat[0 * numDetections + i];
+      final cy = flat[1 * numDetections + i];
+      if (cx < padX || cx > padX + contentW || cy < padY || cy > padY + contentH) continue;
+      final c = flat[4 * numDetections + i];
+      if (c > bestConf) { bestConf = c; bestIdx = i; }
+    }
+
+    if (bestIdx < 0) {
+      debugPrint('[Pose] detect: no detection');
+      return (bbox: null, kpts: null);
+    }
+
+    final cx = flat[0 * numDetections + bestIdx];
+    final cy = flat[1 * numDetections + bestIdx];
+    final bw = flat[2 * numDetections + bestIdx];
+    final bh = flat[3 * numDetections + bestIdx];
+
+    final x1 = (((cx - bw / 2) - padX) / scale).clamp(0.0, origW.toDouble());
+    final y1 = (((cy - bh / 2) - padY) / scale).clamp(0.0, origH.toDouble());
+    final x2 = (((cx + bw / 2) - padX) / scale).clamp(0.0, origW.toDouble());
+    final y2 = (((cy + bh / 2) - padY) / scale).clamp(0.0, origH.toDouble());
+    final bbox = Rect.fromLTRB(x1, y1, x2, y2);
+    debugPrint('[Pose] detect: bbox=$bbox conf=$bestConf');
+
+    final kpts = <Offset>[];
+    int outOfBounds = 0;
+    for (int k = 0; k < 17; k++) {
+      final kx = flat[(5 + k * 3) * numDetections + bestIdx];
+      final ky = flat[(5 + k * 3 + 1) * numDetections + bestIdx];
+      final ox = (kx - padX) / scale;
+      final oy = (ky - padY) / scale;
+      if (ox < 0 || oy < 0 || ox > origW || oy > origH) outOfBounds++;
+      kpts.add(Offset(ox.clamp(0, origW.toDouble()), oy.clamp(0, origH.toDouble())));
+    }
+
+    if (outOfBounds > 8 || kpts.every((p) => p.dx == 0 && p.dy == 0)) {
+      return (bbox: bbox, kpts: null);
+    }
+
+    final posOx = kpts.where((p) => p.dx > 0).map((p) => p.dx).toList();
+    if (posOx.isNotEmpty) {
+      final mean = posOx.reduce((a, b) => a + b) / posOx.length;
+      if (mean < 0.08 * origW || mean > 0.92 * origW) {
+        debugPrint('[Pose] detect: centroid near edge → kpts rejected');
+        return (bbox: bbox, kpts: null);
+      }
+    }
+
+    return (bbox: bbox, kpts: _fillMissingKpts(kpts, origW, origH));
   }
 
   List<Offset>? _decodeOutput(
